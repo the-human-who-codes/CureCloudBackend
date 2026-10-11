@@ -35,6 +35,23 @@ npm run deploy                  # functions + Firestore rules/indexes
 Requires the Blaze plan (Cloud Functions). Deploy the API before any frontend deploy that relies on the
 `/api/**` rewrite.
 
+## CI/CD
+
+`.github/workflows/test.yml` runs the emulator test suite on every PR and push to `main`. After tests pass on
+`main` it deploys functions + Firestore rules/indexes to `curecloud1`.
+
+Deploy setup (one-off):
+
+1. In Google Cloud console → IAM → Service accounts (project `curecloud1`), create `github-deployer` with roles:
+   Cloud Functions Admin, Cloud Run Admin, Service Account User, Artifact Registry Administrator,
+   Firebase Rules Admin, Cloud Datastore Index Admin, Cloud Build Service Account, Firebase Extensions Viewer.
+   Create a JSON key.
+2. GitHub repo → Settings → Secrets → Actions: add `FIREBASE_SERVICE_ACCOUNT_CURECLOUD1` (the JSON key).
+3. Settings → Variables → Actions: add `BOOTSTRAP_ADMIN_EMAIL`.
+4. Settings → Environments: create `production` (optionally require approval).
+
+Until the secret exists, the deploy job is skipped and only tests run.
+
 ## Roles & access
 
 | Role    | How they get it                                                       | Sees                                       |

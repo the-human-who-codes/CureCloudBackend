@@ -1,9 +1,13 @@
-name: Test
+name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -20,3 +24,36 @@ jobs:
           java-version: 21
       - run: npm ci
       - run: npm test
+
+  # Deploys only after tests pass on main. Needs the FIREBASE_SERVICE_ACCOUNT_CURECLOUD1 secret
+  # (see README > CI/CD); skipped until it exists.
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      HAS_CREDENTIALS: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CURECLOUD1 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HAS_CREDENTIALS == 'true'
+      - uses: actions/setup-node@v4
+        if: env.HAS_CREDENTIALS == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev && npm install --no-save firebase-tools@14
+        if: env.HAS_CREDENTIALS == 'true'
+      - uses: google-github-actions/auth@v2
+        if: env.HAS_CREDENTIALS == 'true'
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CURECLOUD1 }}
+      - name: Write function env
+        if: env.HAS_CREDENTIALS == 'true'
+        run: echo "BOOTSTRAP_ADMIN_EMAIL=${{ vars.BOOTSTRAP_ADMIN_EMAIL }}" > .env
+      - name: Deploy functions and Firestore rules/indexes
+        if: env.HAS_CREDENTIALS == 'true'
+        run: npx firebase deploy --only functions,firestore --project curecloud1 --non-interactive --force
+      - name: Skip notice
+        if: env.HAS_CREDENTIALS != 'true'
+        run: echo "::notice::FIREBASE_SERVICE_ACCOUNT_CURECLOUD1 not set; skipping deploy."
