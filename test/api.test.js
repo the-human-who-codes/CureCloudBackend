@@ -20,6 +20,28 @@ describe("CureCloud API", () => {
     assert.equal(res.headers["cache-control"], "no-store");
   });
 
+  test("CORS allows only CureCloud origins", async () => {
+    for (const origin of [
+      "https://curecloud1.web.app",
+      "https://curecloud1--pr24-abc123.web.app",
+      "http://localhost:5173",
+    ]) {
+      const pre = await api()
+        .options("/api/me")
+        .set("Origin", origin)
+        .set("Access-Control-Request-Method", "GET")
+        .set("Access-Control-Request-Headers", "authorization")
+        .expect(204);
+      assert.equal(pre.headers["access-control-allow-origin"], origin);
+      assert.match(pre.headers["access-control-allow-headers"], /Authorization/);
+    }
+
+    const evil = "https://curecloud1.web.app.evil.com";
+    await api().options("/api/me").set("Origin", evil).expect(403);
+    const res = await api().get("/api/health").set("Origin", evil).expect(200);
+    assert.equal(res.headers["access-control-allow-origin"], undefined);
+  });
+
   test("staff signup creates a pending account", async () => {
     const payload = {
       email: "Dr.House@curecloud.test",

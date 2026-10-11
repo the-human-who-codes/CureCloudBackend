@@ -1,6 +1,7 @@
 import express from "express";
 import { errorHandler } from "./lib/http.js";
 import { authenticate } from "./middleware/auth.js";
+import { cors } from "./middleware/cors.js";
 import adminRoutes from "./routes/admin.js";
 import appointmentRoutes from "./routes/appointments.js";
 import authRoutes from "./routes/auth.js";
@@ -13,6 +14,7 @@ import userRoutes, { doctorsRouter } from "./routes/users.js";
 
 export const app = express();
 app.disable("x-powered-by");
+app.use(cors);
 app.use(express.json({ limit: "100kb" }));
 // Health data must never be cached by the Hosting CDN or browsers.
 app.use((_req, res, next) => {
