@@ -4,8 +4,10 @@ REST API for [CureCloud](https://github.com/the-human-who-codes/CureCloud), a he
 public hospitals. Express on a single Cloud Function (`api`) with Firestore, deployed to the `curecloud1`
 Firebase project.
 
-The frontend's Firebase Hosting config rewrites `/api/**` to this function, so the browser calls same-origin
-`/api/...` with `Authorization: Bearer <Firebase ID token>`. All Firestore access goes through this API;
+The function runs in `africa-south1` next to Firestore. Firebase Hosting rewrites don't support that region, so
+the frontend calls the function URL directly (`https://africa-south1-curecloud1.cloudfunctions.net/api/api/...`)
+with `Authorization: Bearer <Firebase ID token>`. CORS (`src/middleware/cors.js`) allows only the live site,
+Hosting preview channels and localhost. All Firestore access goes through this API;
 `firestore.rules` denies direct client access.
 
 ## Local development
@@ -32,8 +34,7 @@ npx firebase login
 npm run deploy                  # functions + Firestore rules/indexes
 ```
 
-Requires the Blaze plan (Cloud Functions). Deploy the API before any frontend deploy that relies on the
-`/api/**` rewrite.
+Requires the Blaze plan (Cloud Functions).
 
 ## CI/CD
 
