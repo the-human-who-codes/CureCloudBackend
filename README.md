@@ -43,8 +43,7 @@ Requires the Blaze plan (Cloud Functions). Deploy the API before any frontend de
 Deploy setup (one-off):
 
 1. In Google Cloud console → IAM → Service accounts (project `curecloud1`), create `github-deployer` with roles:
-   Cloud Functions Admin, Cloud Run Admin, Service Account User, Artifact Registry Administrator,
-   Firebase Rules Admin, Cloud Datastore Index Admin, Cloud Build Service Account, Firebase Extensions Viewer.
+   Firebase Admin, Cloud Functions Admin, Service Account User, Artifact Registry Administrator.
    Create a JSON key.
 2. GitHub repo → Settings → Secrets → Actions: add `FIREBASE_SERVICE_ACCOUNT_CURECLOUD1` (the JSON key).
 3. Settings → Variables → Actions: add `BOOTSTRAP_ADMIN_EMAIL`.
