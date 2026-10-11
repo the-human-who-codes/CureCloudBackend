@@ -43,10 +43,15 @@ Contents
   | `appointmentSlots`          | `{doctorId}_{epochMillis}`                  | A doctor cannot be double-booked             |
   | `medicationAdministrations` | `{prescriptionId}_{epochMillis}` (scheduled doses only) | A scheduled dose is charted only once |
   | `userPreferences`           | `{uid}`                                     | One preferences document per user            |
-  | `patientIdentifiers`        | `sha256("{type}:{value}")` hex              | One patient per national ID or passport      |
+  | `patientIdentifiers`        | `hmacSha256(key, "{type}:{value}")` hex     | One patient per national ID or passport      |
   | `conversations` (direct)    | `direct_{uidA}_{uidB}` (UIDs sorted)        | One direct conversation per pair of users    |
 
-  `patientIdentifiers` uses a hash so that identity numbers never show up in document paths or logs.
+  `patientIdentifiers` uses a keyed hash so that identity numbers never show up in document paths or logs.
+  A plain `sha256` would not be enough: a 13-digit SA ID has a small search space (a valid date, a sequence
+  number and a Luhn check digit), so an unkeyed hash can be reversed by brute force. The key is the secret
+  `PATIENT_IDENTIFIER_KEY` (`defineSecret`); the emulator and tests use the fixed demo key
+  `demo-identifier-key`. Rotating the key requires rehashing every `patientIdentifiers` document (a
+  migration step, not an API operation). Each document is `{ patientId }` plus audit fields.
 
 ### 1.2 Time
 
@@ -61,7 +66,8 @@ Contents
 
 ### 1.3 Audit fields and schema version
 
-Every stored document has these fields. The server sets them and ignores them in request bodies.
+Every stored document has these fields, except append-only `auditEvents` (which has `at` and `actorId`
+instead). The server sets them and ignores them in request bodies.
 
 | Field           | Type             | Notes                                                          |
 | --------------- | ---------------- | -------------------------------------------------------------- |
@@ -73,6 +79,10 @@ Every stored document has these fields. The server sets them and ignores them in
 
 Subcollection documents and embedded objects do not repeat audit fields unless their entity says so.
 
+These fields record only the first and the last writer. The change history lives in the append-only
+`auditEvents` collection ([2.20](#220-auditevent)), which every clinical, patient, care team and
+account-control write appends to in the same batch or transaction.
+
 Denormalized display names (`patientName`, `doctorName`, `authorName` and so on) are **snapshots taken at
 write time**. They are not rewritten when someone is renamed. They exist so list views do not need extra
 reads.
@@ -82,12 +92,18 @@ reads.
 - Clinical records are **never hard-deleted** through the API: patients, vitals, prescriptions, medication
   administrations, medical records, appointments, admissions and messages. There are no `DELETE` endpoints
   for them.
-- Mistakes are corrected with a status transition to `entered-in-error`, which requires a `statusReason`. The
-  document stays in place and is excluded from default list results. Staff can still list it with
-  `?status=entered-in-error`.
-- Finalized medical records are immutable. Corrections are appended as **addenda**
-  ([2.11](#211-medicalrecord)).
-- Patients are deactivated (`status: "inactive"` or `"deceased"`), never removed.
+- How each one is corrected:
+
+  | Entity | Correction |
+  | ------ | ---------- |
+  | VitalSigns, Prescription, MedicationAdministration, MedicalRecord | Status transition to `entered-in-error`, which requires a `statusReason`. The document stays in place and is excluded from default list results. Staff with clinical access can still list it with `?status=entered-in-error` |
+  | MedicalRecord (`final` or `amended`) | Immutable. Corrections are appended as **addenda** ([2.11](#211-medicalrecord)), or the whole record is set to `entered-in-error` |
+  | Appointment | Cancelled (`status: "cancelled"` with `cancellationReason`). A wrongly recorded outcome is not editable in v1 |
+  | Patient | Demographic fields are corrected in place with `PATCH` (each change is in `auditEvents`). The record is deactivated (`status: "inactive"` or `"deceased"`), never removed |
+  | Admission | Corrected in place with `PATCH /patients/{id}/admission`, or closed by discharge, which moves it to the history subcollection |
+  | Message | Append-only. Not correctable in v1 (edit and delete are **Deferred**) |
+  | AuditEvent | Append-only. Never updated or deleted by the API |
+
 - Non-clinical configuration (facilities, departments, channels) is archived with `status: "archived"`.
 - Only relationship rows and ephemera are hard-deleted: care team membership
   (`DELETE /patients/{id}/care-team/{userId}`), appointment slot locks (released on cancel or reschedule),
@@ -133,9 +149,13 @@ public hospitals. If money is ever needed, it is stored as `{ amountCents: integ
 ### 1.8 Pagination
 
 - Every list endpoint accepts `limit` (1 to 100, default 25) and `cursor` (opaque).
-- The cursor is base64url of the last returned document's path. The server loads that snapshot and calls
-  `startAfter(snapshot)`, which costs 1 extra read per page. It fetches `limit + 1` documents to decide
-  whether `nextCursor` is set. If the cursor document is invalid or missing, the server returns `400`.
+- The cursor is base64url of the JSON array `[...orderByValues, docId]`: the last returned document's values
+  for the list's `orderBy` fields (timestamps as ISO strings, re-typed on decode) followed by its document
+  ID. The server calls `startAfter(...values, docId)` on the same scoped query, so a cursor never loads a
+  document and needs no extra read. It cannot reach another collection or a resource the caller cannot see,
+  because the query it is applied to is already scoped. The server fetches `limit + 1` documents to decide
+  whether `nextCursor` is set. A cursor that does not decode, or whose length or value types do not match
+  the list's sort order, returns `400 invalid-cursor`.
 - Every list has a fixed, documented sort order with the document ID as tie-breaker.
 - Endpoints that are bounded by construction are not paginated and say so: medication schedule for one day,
   dashboard, reports, care team, preferences.
@@ -167,7 +187,7 @@ Every error response is `Content-Type: application/problem+json`:
 | -------------------------- | ------ | ---------------------------------------------------------------------------- |
 | `validation-error`         | 400    | Body or query failed validation                                              |
 | `malformed-json`           | 400    | Body is not valid JSON                                                       |
-| `invalid-cursor`           | 400    | Pagination cursor cannot be decoded or does not exist                        |
+| `invalid-cursor`           | 400    | Pagination cursor cannot be decoded or does not match the list's sort order  |
 | `unauthenticated`          | 401    | Missing, invalid or expired bearer token                                     |
 | `profile-required`         | 403    | Signed in but no `users` document (call `POST /me`)                          |
 | `account-pending`          | 403    | Staff account awaiting approval                                              |
@@ -175,10 +195,10 @@ Every error response is `Content-Type: application/problem+json`:
 | `forbidden`                | 403    | Role lacks the permission, or a field-level rule denies the write            |
 | `not-found`                | 404    | Resource missing **or not visible to the caller** (see [3.5](#35-denial-semantics)) |
 | `conflict`                 | 409    | Generic uniqueness conflict (profile exists, email exists)                   |
-| `slot-unavailable`         | 409    | Appointment slot already booked                                              |
+| `slot-unavailable`         | 409    | Appointment slot already booked, or outside opening hours or the doctor's leave |
 | `invalid-state-transition` | 409    | Status change not allowed from the current status                            |
 | `record-immutable`         | 409    | Edit attempted on a final medical record or a terminal resource              |
-| `duplicate-identifier`     | 409    | Another patient already has this national ID or passport                     |
+| `duplicate-identifier`     | 409    | Another patient already has this national ID or passport (staff-only disclosure, see [3.4](#34-field-level-rules)) |
 | `already-charted`          | 409    | Scheduled dose already has an administration                                 |
 | `internal`                 | 500    | Unexpected error (the message is never leaked)                               |
 
@@ -205,7 +225,11 @@ The frontend `ApiError` exposes `status`, `code`, `message` (= `detail ?? title`
   parameters, its request body, its responses and its problem types. Security scheme: `bearerAuth` (HTTP
   bearer, Firebase ID token).
 - The README endpoint table is deleted and replaced with a link to `/api/docs` and to this document.
-- A test asserts that every Express route is in the spec and that the spec validates.
+- Routes are registered through one helper, `defineRoute(router, { method, path, permission, request,
+  responses })` in `src/lib/route.js`. It mounts the Express handler (with `requirePermission` and zod
+  validation) and registers the same path in the OpenAPI registry, and it records each call in a route
+  list. Express 5 does not expose its route table, so the coverage test compares that list with the spec's
+  paths and operations, and also validates the spec.
 
 ### 1.12 Data classification
 
@@ -220,9 +244,16 @@ classes:
 | `PII-high` | Identity documents; field-level restricted                 | national ID, passport number              |
 | `PHI`      | Health information                                         | vitals, diagnoses, prescriptions, notes, messages, appointment reason |
 
-Rules: never log request or response bodies. Log IDs, route templates, status codes and the caller UID only.
-PHI is never put in notification text beyond what the recipient can already see. PHI is never put in
-`detail` messages.
+Rules: never log request or response bodies. Application logs record IDs, route templates, status codes and
+the caller UID only. PHI is never put in notification text beyond what the recipient can already see. PHI is
+never put in `detail` messages.
+
+Accepted risk: Cloud Run request logs (which back the function) record full URLs, including query strings.
+The only query parameter that carries personal information is the name prefix `q` on `GET /patients` and
+`GET /users`/`GET /practitioners` (a few letters of a name, never an ID number, which is not searchable).
+v1 accepts this: those logs are in the same project, readable only by project owners, with the default
+30-day retention. Moving search to a `POST …/search` body is the fallback if this is ever judged
+insufficient. No other query parameter may carry PII or PHI; IDs, enums and instants only.
 
 ---
 
@@ -273,7 +304,7 @@ status and organisational scoping. For doctors and nurses it also holds the Prac
 | `id`               | string                                             | ✓   | internal | Firebase UID |
 | `email`            | string                                             | ✓   | PII      | From the Auth token, lowercased |
 | `name`             | string                                             | ✓   | internal | Display name |
-| `phone`            | string                                             |     | PII      | E.164 (renamed from `phoneNumber`) |
+| `phone`            | string                                             |     | PII      | E.164 (renamed from `phoneNumber`). Staff and admins only, see "Contact data" below |
 | `photoUrl`         | string (URL)                                       |     | internal | From the Google profile |
 | `role`             | `"patient" \| "nurse" \| "doctor" \| "admin"`      | ✓   | internal | |
 | `status`           | `"pending" \| "active" \| "disabled"`              | ✓   | internal | Patients start `active`; staff start `pending` |
@@ -281,7 +312,7 @@ status and organisational scoping. For doctors and nurses it also holds the Prac
 | `facilityId`       | string                                             |     | internal | Required to activate staff. `null` on an admin means **system admin** |
 | `departmentId`     | string                                             |     | internal | Required for nurses before activation; optional for doctors |
 | `identifier`       | Identifier                                         |     | PII-high | Staff only (from signup). Replaces `nationalId` |
-| `emergencyContact` | EmergencyContact                                   |     | PII      | |
+| `emergencyContact` | EmergencyContact                                   |     | PII      | Staff and admins only, see "Contact data" below |
 | `practitioner`     | Practitioner                                       |     | internal | Present iff `role` is `doctor` or `nurse` |
 | `lastSignInAt`     | timestamp                                          |     | internal | **Not stored.** Read from Firebase Auth metadata on admin list and detail reads |
 
@@ -289,11 +320,34 @@ Status transitions: `pending → active` (approve), `pending → disabled` (reje
 `active ↔ disabled`. Changing status keeps Firebase Auth `disabled` in sync, and disabling also calls
 `revokeRefreshTokens`.
 
-Invariants:
+Invariants (all enforced by `PATCH /users/{id}`; a violation returns `403 forbidden` unless stated):
 
-- Patients cannot become staff and staff cannot become patients.
-- Nobody can change their own role or status.
-- The last active system admin cannot be demoted or disabled (`409 conflict`).
+- Patients cannot become staff and staff cannot become patients (`400 validation-error`).
+- **Nobody may change their own `role`, `status`, `facilityId` or `departmentId`.** `PATCH /users/{ownId}`
+  with any of them returns `403`. Self-service edits go through `PATCH /me`, which does not accept them.
+- **Only a system admin may**:
+  - grant or revoke `role: "admin"`;
+  - set, change or clear `facilityId` on an admin account (clearing it creates a system admin);
+  - modify any admin account in any way;
+  - modify a patient account (`role: "patient"`), for example to disable it.
+- **A facility admin may only manage doctors and nurses** that are either in their facility, or `pending`
+  with `facilityId: null` (self-signups awaiting assignment). When a facility admin sets `facilityId`, it must
+  be their own facility. A facility admin cannot move staff out of their facility (only a system admin can).
+- **The last active system admin** cannot be demoted, disabled, or given a non-null `facilityId`
+  (`409 conflict`).
+- Role changes between `doctor` and `nurse` re-derive `practitioner.licenceBody` and require a new
+  `practitioner.licenceNumber` in the same request (licence numbers are body-specific). Promotion of a
+  doctor or nurse to `admin` moves `practitioner` to `legacy.practitioner`; demotion from admin to doctor or
+  nurse creates a new `practitioner` and requires `licenceNumber` (and `departmentId` for nurses).
+- Every change to `role`, `status`, `facilityId` or `departmentId` appends an `auditEvents` entry
+  ([2.20](#220-auditevent)) in the same transaction.
+
+Contact data: for `role: "patient"` the linked Patient document is the **single source of truth** for
+`phone`, `emergencyContact` and contact `email`. The patient's `users` document stores neither `phone` nor
+`emergencyContact` (the migration moves them, see [6](#6-data-migration)), and `PATCH /me` rejects those
+fields for patients with `403 forbidden` naming the field. `User.email` is always the **sign-in email** from
+Firebase Auth and is never edited through the API; `Patient.email` is a separate contact email that the
+patient or staff may change. For staff and admins, `User.phone` and `User.emergencyContact` are the source.
 
 Indexes: see [2.19](#219-index-summary). Lists sort by `nameLower`.
 
@@ -315,9 +369,9 @@ request. Exposed through the User resource and the practitioner directory.
 Self-editable fields (`PATCH /me`): `specialization`, `qualifications`, `practisingSince`, `officeLocation`,
 `bio`. Admin-editable fields (`PATCH /users/{id}`): all of them.
 
-`PractitionerSummary` is the directory projection: `{ id, name, role, specialization, photoUrl, facilityId,
-facilityName, departmentId, departmentName }`. Facility and department names are resolved per request with
-`getAll`.
+`PractitionerSummary` is the directory projection: `{ id, name, role, email, specialization, photoUrl,
+facilityId, facilityName, departmentId, departmentName }`. Facility and department names are resolved per
+request with `getAll`. `email` is the work (sign-in) email; it is redacted (omitted) for patient callers.
 
 ### 2.3 Facility
 
@@ -332,7 +386,9 @@ Collection `facilities/{id}`. Usually a hospital.
 | `email`    | string                                                     |     | public |
 | `status`   | `"active" \| "archived"`                                   | ✓   | public |
 
-The migration creates `facilities/default` if no facility exists ([6](#6-data-migration)).
+Facilities are read-only through the API in v1 (`GET /facilities`). They are created by the migration
+(`facilities/default` if no facility exists, see [6](#6-data-migration)) and by `scripts/seed.js`.
+Facility management endpoints are **Deferred**.
 
 ### 2.4 Department
 
@@ -362,7 +418,8 @@ Collection `patients/{id}`. Demographics, clinical summary and current admission
 | ------------------- | ------------------------------------------------------------ | --- | -------- | ----- |
 | `id`                | string                                                       | ✓   | internal | |
 | `userId`            | string                                                       |     | internal | Linked account, `null` for walk-ins |
-| `facilityId`        | string                                                       |     | internal | Registering facility. Set on first booking if `null` |
+| `facilityId`        | string                                                       |     | internal | Registering facility. `null` for a self-registered patient until their first booking sets it to the doctor's facility. After that only a system admin may change it |
+| `folderNumber`      | string `^[A-Za-z0-9/-]{1,30}$`                               |     | PII      | Hospital folder number (MRN) issued by the facility. Shown in the UI instead of the opaque `id`. Not unique-enforced in v1 |
 | `status`            | `"active" \| "inactive" \| "deceased"`                       | ✓   | PHI      | Default `active` |
 | `deceasedAt`        | date                                                         |     | PHI      | Required iff `status = deceased` |
 | `name`              | string                                                       | ✓   | PII      | |
@@ -371,7 +428,7 @@ Collection `patients/{id}`. Demographics, clinical summary and current admission
 | `birthDate`         | date                                                         |     | PII      | Renamed from `dateOfBirth` |
 | `sex`               | `"female" \| "male" \| "intersex" \| "unknown"`              | ✓   | PHI      | Administrative sex as on ID documents. Default `unknown` |
 | `phone`             | string                                                       |     | PII      | |
-| `email`             | string                                                       |     | PII      | |
+| `email`             | string                                                       |     | PII      | Contact email. Not the sign-in email (that is `User.email`) |
 | `address`           | Address                                                      |     | PII      | |
 | `emergencyContact`  | EmergencyContact                                             |     | PII      | |
 | `identifier`        | Identifier                                                   |     | PII-high | Readable only by self and admin ([3.4](#34-field-level-rules)). Unique through `patientIdentifiers` |
@@ -379,8 +436,8 @@ Collection `patients/{id}`. Demographics, clinical summary and current admission
 | `allergies`         | `Allergy[]` ≤50                                              | ✓   | PHI      | Default `[]` |
 | `noKnownAllergies`  | boolean                                                      | ✓   | PHI      | `true` only when `allergies` is empty. It separates "no known allergies" from "not yet recorded" |
 | `chronicConditions` | `Condition[]` ≤50                                            | ✓   | PHI      | Default `[]` |
-| `acuity`            | `"stable" \| "moderate" \| "high" \| "critical"`             | ✓   | PHI      | Renamed from `priority`. Default `stable` |
-| `admission`         | Admission                                                    |     | PHI      | Current inpatient stay, or `null` |
+| `acuity`            | `"stable" \| "moderate" \| "high" \| "critical"`             | ✓   | PHI      | Renamed from `priority`. Default `stable`. Self and clinical only |
+| `admission`         | Admission                                                    |     | PII      | Current inpatient stay, or `null`. Classed PII (a person's location), not PHI: admins see it for bed management ([3.4](#34-field-level-rules)). It holds no diagnosis, only department and bed |
 | `careTeam`          | string[] ≤50                                                 | ✓   | internal | User IDs of doctors and nurses. Managed only through the care team endpoints |
 | `latestVitals`      | VitalSigns subset + `recordedAt`                             |     | PHI      | Renamed from `vitals`. Denormalized, see [2.6](#26-vitalsigns-observation) |
 
@@ -448,7 +505,7 @@ Collection `appointments/{id}`. Slot locks live in `appointmentSlots/{doctorId}_
 | `end`                | timestamp                                         | ✓   | PHI      | `start + durationMinutes` |
 | `durationMinutes`    | `15 \| 30 \| 45 \| 60`                            | ✓   | PHI      | Default from system settings (30) |
 | `type`               | `"check-up" \| "consultation" \| "follow-up" \| "procedure" \| "test" \| "vaccination" \| "other"` | ✓ | PHI | Default `check-up` |
-| `reason`             | string ≤1000                                      |     | PHI      | Reason for the visit. Replaces `notes`. Hidden from admins |
+| `reason`             | string ≤1000                                      |     | PHI      | Reason for the visit. Replaces `notes`. Self and clinical only ([3.4](#34-field-level-rules)) |
 | `status`             | see lifecycle                                     | ✓   | PHI      | |
 | `cancellationReason` | string ≤200                                       |     | PHI      | |
 | `cancelledBy`        | string                                            |     | internal | |
@@ -476,10 +533,25 @@ pending ──▶ confirmed ──▶ checked-in ──▶ completed
 in the same transaction. Booking checks:
 
 - The doctor is active.
-- `now + minLeadTimeMinutes ≤ start ≤ now + bookingWindowDays`.
+- `now + minLeadTimeMinutes ≤ start ≤ now + bookingWindowDays` (otherwise `400 validation-error`).
+- The whole interval `[start, end)` lies inside `appointments.openingHours` on an allowed weekday, in SAST
+  ([2.16](#216-systemsettings)). Otherwise `409 slot-unavailable`.
+- The interval does not overlap a `scheduled` `leave` shift of the doctor ([2.12](#212-shift-staff-schedule)).
+  Otherwise `409 slot-unavailable`.
 - All 15-minute slot locks for the duration are free (otherwise `409 slot-unavailable`).
 
-Booking adds the doctor to `patient.careTeam`, as it does today, and sets `patient.facilityId` if it is null.
+Reschedules run the same checks for the new interval.
+
+`GET /practitioners/{id}/busy` returns the doctor's booked intervals (from the slot locks) merged with their
+`scheduled` `leave` shifts, as `{ start, end }` only. The UI computes candidate slots as **the opening hours
+of the chosen day, on 15-minute boundaries, minus the busy intervals**, minus anything before
+`now + minLeadTimeMinutes`.
+
+Booking adds the doctor to `patient.careTeam`, as it does today, whoever makes the booking (patient, nurse,
+doctor or admin). This is deliberate: the booked doctor needs clinical access to conduct the visit, so the
+grant goes to the treating doctor and not to the booker. A nurse or admin booking does not gain any access
+themselves, and the care team change is written to `auditEvents` with the booker as actor. Booking also sets
+`patient.facilityId` to the doctor's facility if it is null.
 
 ### 2.8 Prescription (MedicationRequest)
 
@@ -497,7 +569,7 @@ Collection `prescriptions/{id}`.
 | `route`               | `"oral" \| "sublingual" \| "iv" \| "im" \| "sc" \| "topical" \| "inhaled" \| "rectal" \| "ophthalmic" \| "otic" \| "nasal" \| "other"` | ✓ | PHI | Default `oral` |
 | `frequency`           | see table                              | ✓   | PHI      | Replaces free-text frequency |
 | `frequencyText`       | string ≤100                            |     | PHI      | Required iff `frequency = custom` |
-| `administrationTimes` | `HH:mm[]` ≤12                          | ✓   | PHI      | Defaults from `frequency`; required non-empty for `custom` |
+| `administrationTimes` | `HH:mm[]` ≤12                          | ✓   | PHI      | Defaults from `frequency`. `once` requires exactly one entry; `custom` requires at least one |
 | `instructions`        | string ≤2000                           |     | PHI      | Renamed from `notes` |
 | `refills`             | int 0–12                               | ✓   | PHI      | Default 0 |
 | `startDate`           | date                                   | ✓   | PHI      | |
@@ -508,7 +580,7 @@ Collection `prescriptions/{id}`.
 
 | `frequency`          | Default `administrationTimes`         |
 | -------------------- | ------------------------------------- |
-| `once`               | the start time (single dose on `startDate`) |
+| `once`               | none: exactly one time must be supplied (single dose on `startDate` at that time) |
 | `once-daily`         | `08:00`                               |
 | `twice-daily`        | `08:00, 20:00`                        |
 | `three-times-daily`  | `08:00, 14:00, 20:00`                 |
@@ -611,7 +683,8 @@ Collection `careTasks/{id}`. Nursing work items.
 | `completionNote` | string ≤1000                                                                  |     | PHI      | |
 
 Transitions: `open → in-progress → completed`, `in-progress → open` (release), `open|in-progress →
-cancelled` (creator or any doctor, reason in `completionNote`). Completed and cancelled tasks are terminal.
+cancelled` (the creator, or a doctor with clinical access to the task's patient; reason in
+`completionNote`). Completed and cancelled tasks are terminal.
 Any nurse in the department may claim an unassigned task (`assigneeId` set to themselves) or reassign within
 the department. Assigning a task to someone notifies them.
 
@@ -675,12 +748,15 @@ Collection `shifts/{id}`.
 | `type`          | `"morning" \| "afternoon" \| "night" \| "day" \| "on-call" \| "leave"` | ✓ | internal | `leave` blocks the time and counts as "On leave" |
 | `start`, `end`  | timestamp                                                          | ✓   | internal | `end > start`, at most 24h long. No overlap for the same staff member (`409 conflict`) |
 | `status`        | `"scheduled" \| "cancelled"`                                       | ✓   | internal | |
-| `handoverNote`  | string ≤2000                                                       |     | PHI      | Written by the shift owner for the next shift |
+| `handoverNote`  | string ≤2000                                                       |     | PHI      | Written by the shift owner for the next shift. Visible only to the owner and to doctors and nurses in the same department, never to admins ([3.4](#34-field-level-rules)) |
 | `handoverAt`    | timestamp                                                          |     | internal | |
 
 "On duty" (computed) means `status = scheduled`, `type ≠ leave` and `start ≤ now < end`. Shift queries use
 `start` in `[from − 24h, to)` and filter `end > from` in memory, which is valid because shifts are at most
-24h long. Recurring rotas and doctor booking availability templates are **Deferred**.
+24h long. Admins create and cancel shifts one at a time from the Roster panel ([5.4](#54-admin-admin)). A `leave`
+shift also blocks the doctor's bookable time ([2.7](#27-appointment)). Recurring rotas and doctor
+availability templates are **Deferred**; bookable time is the facility opening hours minus bookings and
+leave.
 
 ### 2.13 Notification
 
@@ -740,10 +816,15 @@ Type rules:
 - `direct`: exactly 2 active staff in the same facility. The ID is deterministic, so creating it twice
   returns the existing one.
 - `group`: 3 to 50 staff.
-- `channel`: created by an admin. Any active staff member of the facility (or of the department, when
-  `departmentId` is set) can read and post.
-- `patient`: participants are the patient's `userId` plus at least one doctor or nurse on the patient's
-  care team. It can be created by the patient or by such a staff member.
+- `channel`: created by an admin of the facility. Any active doctor, nurse or admin of the facility (or of
+  the department, when `departmentId` is set) can read and post. Patients never can.
+- `patient`: **exactly one** patient participant, which must be the `userId` of the conversation's
+  `patientId` (a patient without an account cannot have one, `400`). **Every other** participant must be an
+  active doctor or nurse who is currently on that patient's care team. At least one such staff member is
+  required. It can be created by the patient or by such a staff member. Any participant that fails these
+  rules returns `403 forbidden`. Participants cannot be changed in v1 (`PATCH` accepts only `title` and
+  `status`); any future participant change must re-run the same check. A staff participant later removed
+  from the care team loses access through the `clinical` check in the matrix.
 
 Message (PHI): `{ id, senderId, senderName, senderRole, text (1–4000), createdAt }`. Messages are
 append-only in v1. Editing, deleting, attachments, reactions and quick-response templates are **Deferred**.
@@ -759,10 +840,10 @@ Document `userPreferences/{uid}`. `GET` returns the defaults when the document d
 | --------------- | ---------------------------------------------- | ----------------------- |
 | `notifications` | `{ inApp: boolean, email: boolean, sms: boolean }` | `{ true, false, false }` (email and SMS delivery are **Deferred**; the values are stored only) |
 | `language`      | `"en" \| "af" \| "zu" \| "xh"`                 | `en` (only English UI copy exists in v1) |
-| `timeZone`      | IANA zone (validated with `Intl.supportedValuesOf`) | `Africa/Johannesburg` |
-| `theme`         | `"light" \| "dark" \| "system"`                | `light`                 |
-| `calendarView`  | `"day" \| "week" \| "month"`                   | `week`                  |
-| `listView`      | `"list" \| "grid" \| "table"`                  | `list`                  |
+| `timeZone`      | IANA zone (validated with `Intl.supportedValuesOf`) | `Africa/Johannesburg` (used by `formatDateTime` in the UI) |
+
+Theme, calendar view and list view preferences are not modelled: no page uses them (dark mode and calendar
+views are **Deferred**), so the Settings page does not show those controls.
 
 Class: internal. Audit fields: `updatedAt` and `updatedBy` only.
 
@@ -781,8 +862,13 @@ fields fall back to the defaults below. The server caches the document in memory
 | `appointments.bookingWindowDays`              | int 1–365     | 90              | API         |
 | `appointments.minLeadTimeMinutes`             | int 0–1440    | 60              | API         |
 | `appointments.patientCancellationCutoffHours` | int 0–72      | 2               | API         |
+| `appointments.openingHours`                   | `{ start: HH:mm, end: HH:mm, days: int[] }` | `{ start: "08:00", end: "16:30", days: [1,2,3,4,5] }` | API (booking and reschedule) and UI (slot picker) |
 | `security.sessionTimeoutMinutes`              | int 5–480     | 30              | UI (idle sign-out) |
 | `maintenanceBanner`                           | string ≤300   | `null`          | UI (banner for all users) |
+
+`openingHours` is in SAST wall-clock time. `days` uses ISO weekdays (1 = Monday … 7 = Sunday), at least one,
+no duplicates. `start` and `end` are on 15-minute boundaries with `start < end`. Per-facility hours are
+**Deferred**.
 
 Facility contact details live on Facility, not here. Backups, integrations, IP allowlists and password
 policy are not app settings: Firebase or GCP handles them, or they are **Deferred**.
@@ -797,7 +883,7 @@ Collection `systemAlerts/{id}`. Operational alerts for admins, shared rather tha
 | `message`    | string ≤500                              | ✓   | No PHI |
 | `severity`   | `"info" \| "warning" \| "critical"`      | ✓   | |
 | `status`     | `"active" \| "resolved"`                 | ✓   | |
-| `source`     | `"system" \| "manual"`                   | ✓   | |
+| `source`     | `"system"`                               | ✓   | Manually raised alerts are **Deferred** (adding `"manual"` later is an additive change) |
 | `facilityId` | string                                   |     | `null` means system-wide |
 | `resource`   | ResourceRef                              |     | |
 | `resolvedAt`, `resolvedBy` | timestamp, string          |     | |
@@ -833,6 +919,13 @@ type ReportSummary = {
 };
 ```
 
+Admins have no clinical access, so for admin callers the clinical aggregates (`patients.byAcuity`,
+`patients.topConditions`, `prescriptions.topMedications`) use a **small-cell rule**: any count from 1 to 4
+is returned as `null` (the UI shows "<5"), and `topConditions` and `topMedications` entries with a count
+below 5 are dropped. This applies to every admin report and is required when filtering by department, where
+counts are small enough to point at individuals. Doctors and nurses get exact counts, because the scope is
+already their clinical patients. The admin dashboard shows no clinical aggregates.
+
 Implementation: a bounded scan with `select()` projections of the scoped patients, the appointments in the
 period and the prescriptions, capped at 2,000 documents per collection (`meta.truncated` is set when the cap
 is hit), aggregated in memory. The period is at most 366 days. CSV export is done client-side from this
@@ -846,16 +939,29 @@ JSON. Stored or scheduled report generation is **Deferred**.
 Composite indexes for `firestore.indexes.json`. Single-field indexes are automatic. `__name__` ordering is
 implicit.
 
+The Firestore emulator does **not** enforce composite indexes, so a missing index only fails in production.
+Two rules keep this safe:
+
+- Every `scoped.*` builder ([3.6](#36-module-shape)) exposes `queryShapes(filters)`, which returns the
+  `{ collection, equality: [...], arrayContains?, orderBy }` shape of every query it would issue (one per
+  `Filter.or` branch). `test/indexes.test.js` enumerates every allowed filter combination for every builder
+  and asserts that each shape is served by `firestore.indexes.json`: either an exact composite, or one
+  `(field, orderBy)` composite per equality or array-contains field (Firestore's index merging combines
+  them). A new filter without an index fails the test.
+- Filter combinations are restricted to keep the set finite. On `/users`, `q` combines only with `role`
+  and `status`. On `/patients`, `q` combines only with `acuity`. Other combinations return `400`.
+
 | Collection                  | Fields                                                                 | Used by |
 | --------------------------- | ---------------------------------------------------------------------- | ------- |
 | `users`                     | `role, status, nameLower`                                              | directory, admin list |
 | `users`                     | `facilityId, nameLower` · `facilityId, role, nameLower` · `facilityId, status, nameLower` · `facilityId, role, status, nameLower` | admin list (scoped) |
 | `users`                     | `role, nameLower` · `status, nameLower`                                | system admin list |
-| `users`                     | `departmentId, role, status, nameLower`                                | department directory |
+| `users`                     | `departmentId, role, status, nameLower` · `departmentId, nameLower`     | department directory, roster staff picker |
+| `users`                     | `facilityId, departmentId, nameLower`                                  | facility admin filtering by department |
 | `patients`                  | `careTeam CONTAINS, nameLower`                                         | clinician list (kept) |
 | `patients`                  | `careTeam CONTAINS, acuity, nameLower`                                 | acuity filter, critical count |
 | `patients`                  | `admission.departmentId, nameLower` · `admission.departmentId, acuity, nameLower` | ward nurse list (OR branch) |
-| `patients`                  | `facilityId, nameLower`                                                | admin list |
+| `patients`                  | `facilityId, nameLower`                                                | facility admin list (system admin uses the single-field `nameLower` index) |
 | `appointments`              | `patientId, start` · `doctorId, start` · `departmentId, start` · `facilityId, start` | lists (replace the `scheduledAt` indexes) |
 | `appointments`              | `patientId, status, start` · `doctorId, status, start` · `departmentId, status, start` · `facilityId, status, start` | status filters, counters |
 | `appointmentSlots`          | `doctorId, start`                                                      | busy times |
@@ -872,6 +978,35 @@ implicit.
 | `conversations`             | `participantIds CONTAINS, lastMessageAt DESC` · `facilityId, type, lastMessageAt DESC` | conversation list |
 | `systemAlerts`              | `status, createdAt DESC` · `facilityId, status, createdAt DESC`         | alert list |
 | `departments`               | `facilityId, name`                                                     | department list |
+| `auditEvents`               | none in v1 (write-only; the read API is **Deferred**)                  | |
+
+### 2.20 AuditEvent
+
+Collection `auditEvents/{autoId}`. An append-only write audit that records **who changed what, and when**,
+without storing values. It meets the POPIA accountability requirement for changes to special personal
+information; the per-read access log is still **Deferred**.
+
+| Field           | Type                                                     | Req | Class    | Notes |
+| --------------- | -------------------------------------------------------- | --- | -------- | ----- |
+| `at`            | timestamp                                                | ✓   | internal | Server time of the write |
+| `actorId`       | string                                                   | ✓   | internal | User ID, or `"system"` (migration, automatic alert resolution) |
+| `actorRole`     | role \| `"system"`                                       | ✓   | internal | Snapshot |
+| `action`        | `"create" \| "update" \| "status-change" \| "delete"`     | ✓   | internal | `delete` only for relationship rows (care team removal) |
+| `resource`      | ResourceRef (+ `"vitals" \| "medication-administration" \| "care-team" \| "admission" \| "shift"`) | ✓ | internal | The changed document |
+| `patientId`     | string                                                   |     | internal | Set whenever the resource belongs to a patient, for a future per-patient history |
+| `changedFields` | string[]                                                 | ✓   | internal | Top-level field names only (`["allergies", "acuity"]`). **Never values**, so the log holds no PHI |
+
+It is written by `writeAudit(txOrBatch, actor, { action, resource, patientId?, changedFields })` in the same
+transaction or batch as the change itself, for every write to:
+
+- patients (create, PATCH, admission, discharge, care team add and remove, including the implicit add on
+  booking);
+- vitals, prescriptions, medication administrations, medical records (including addenda) and care tasks;
+- appointments (create, status changes, reschedule);
+- users: any change to `role`, `status`, `facilityId` or `departmentId`, and practitioner licence fields.
+
+AuditEvent documents carry no `updatedAt`/`updatedBy` (they are never updated) and are never serialized by
+v1 endpoints. A read API for admins and a patient-facing access history are **Deferred**.
 
 ---
 
@@ -902,13 +1037,13 @@ in [3.3](#33-relationship-and-attribute-rules)). A blank cell means denied.
 | `preferences:read`, `preferences:update` | ✓ | ✓ | ✓ | ✓ | self |
 | `dashboard:read`                    | ✓ | ✓ | ✓ | ✓ | own scope |
 | `practitioner:list`                 | ✓ | ✓ | ✓ | ✓ | patients get `PractitionerSummary` of active doctors only |
-| `user:list`, `user:read`, `user:update` |   |   |   | ✓ | facility |
+| `user:list`, `user:read`            |   |   |   | ✓ | `userScope`: system admin all; facility admin own-facility staff and admins plus pending unassigned staff, never patient accounts |
+| `user:update`                       |   |   |   | ✓ | `userScope`, then the invariants in [2.1](#21-user-account) (admin accounts, `role: admin` and patient accounts: system admin only) |
 | `facility:read`                     | ✓ | ✓ | ✓ | ✓ | active facilities |
-| `facility:manage`                   |   |   |   | ✓ | system admin |
 | `department:read`                   |   | ✓ | ✓ | ✓ | same facility (system admin: all) |
 | `department:manage`                 |   |   |   | ✓ | facility |
-| `patient:list`                      |   | ✓ | ✓ | ✓ | clinical (nurse, doctor), facility (admin) |
-| `patient:read`                      | ✓ | ✓ | ✓ | ✓ | self / clinical / facility (demographics only) |
+| `patient:list`                      |   | ✓ | ✓ | ✓ | clinical (nurse, doctor), facility (admin; patients with `facilityId: null` only for system admins) |
+| `patient:read`                      | ✓ | ✓ | ✓ | ✓ | self / clinical / facility (demographics and admission only) |
 | `patient:create`                    |   | ✓ | ✓ | ✓ | created in the caller's facility. Nurse and doctor creators join the care team |
 | `patient:update`                    | ✓ | ✓ | ✓ | ✓ | field sets per [3.4](#34-field-level-rules) |
 | `patient:read-identifier`           | ✓ | | | ✓ | self / facility |
@@ -917,7 +1052,7 @@ in [3.3](#33-relationship-and-attribute-rules)). A blank cell means denied.
 | `vitals:read`                       | ✓ | ✓ | ✓ |   | self / clinical |
 | `vitals:create`                     |   | ✓ | ✓ |   | clinical |
 | `vitals:retract`                    |   | ✓ | ✓ |   | author |
-| `appointment:read`                  | ✓ | ✓ | ✓ | ✓ | own (patient) / own or clinical (doctor) / clinical or same department (nurse) / facility without `reason` (admin) |
+| `appointment:read`                  | ✓ | ✓ | ✓ | ✓ | own (patient) / own or clinical (doctor) / clinical or same department (nurse) / facility (admin). `reason` per [3.4](#34-field-level-rules) |
 | `appointment:create`                | ✓ | ✓ | ✓ | ✓ | self / clinical / facility |
 | `appointment:update`                | ✓ | ✓ | ✓ | ✓ | transition table in [2.7](#27-appointment) |
 | `practitioner:read-busy`            | ✓ | ✓ | ✓ | ✓ | any active doctor (returns times only) |
@@ -934,16 +1069,16 @@ in [3.3](#33-relationship-and-attribute-rules)). A blank cell means denied.
 | `medical-record:update`             |   | ✓ | ✓ |   | author (edit while preliminary, finalise, addendum, retract) |
 | `care-task:read`                    |   | ✓ | ✓ |   | nurse: department, assignee or creator. Doctor: creator, or clinical for the task's patient |
 | `care-task:create`                  |   | ✓ | ✓ |   | patient tasks need clinical access |
-| `care-task:update`                  |   | ✓ | ✓ |   | nurse: department or assignee. Doctor: creator |
-| `shift:read`                        |   | ✓ | ✓ | ✓ | own + same facility roster |
+| `care-task:update`                  |   | ✓ | ✓ |   | nurse: department or assignee. Doctor: creator, or clinical for the task's patient |
+| `shift:read`                        |   | ✓ | ✓ | ✓ | own + same facility roster (`handoverNote` per [3.4](#34-field-level-rules)) |
 | `shift:manage`                      |   |   |   | ✓ | facility |
 | `shift:handover`                    |   | ✓ | ✓ | ✓ | shift owner |
 | `notification:read`, `notification:update` | ✓ | ✓ | ✓ | ✓ | owner |
-| `conversation:read`, `conversation:create`, `message:create` | ✓ | ✓ | ✓ | ✓ | participant / channel member. Patients: `patient` type only, with their care team. Staff in a `patient` conversation must still have clinical access |
+| `conversation:read`, `conversation:create`, `message:create` | ✓ | ✓ | ✓ | ✓ | participant / channel member. Patients: `patient` type only, per the type rules in [2.14](#214-conversation-and-message). Staff in a `patient` conversation must still have clinical access |
 | `channel:manage`                    |   |   |   | ✓ | facility |
 | `system-settings:read`              | ✓ | ✓ | ✓ | ✓ | |
 | `system-settings:update`            |   |   |   | ✓ | system admin |
-| `system-alert:read`, `system-alert:manage` | | |   | ✓ | facility (system admin: all) |
+| `system-alert:read`, `system-alert:manage` | | |   | ✓ | facility (system admin: all). `manage` is resolve only in v1 |
 | `report:read`                       |   | ✓ | ✓ | ✓ | scope per [2.18](#218-reports-aggregation-only-nothing-stored) |
 
 `GET /me` returns the caller's role permissions as `permissions: string[]`. The UI uses them to show or
@@ -960,9 +1095,12 @@ These are pure functions over `(user, resource)`, defined once in `policy.js`:
 | `ward`        | `user.role === "nurse" && user.departmentId && patient.admission?.departmentId === user.departmentId` |
 | `clinical`    | `user.role ∈ {doctor, nurse} && (careTeam \|\| ward)`. Child resources (vitals, prescriptions, records, administrations, tasks) inherit it from their patient |
 | `author`      | `resource.createdBy === user.id` (also `authorId`, `performerId` or `prescriberId` per entity) |
-| `facility`    | `user.facilityId === null` (system admin) `\|\| resource.facilityId === user.facilityId \|\| resource.facilityId === null` (unassigned records are visible to every admin) |
-| `department`  | `resource.departmentId === user.departmentId` |
-| `participant` | `conversation.participantIds.includes(user.id)`, or for channels `facility && (conversation.departmentId == null \|\| department)` |
+| `systemAdmin` | `user.role === "admin" && user.facilityId === null` |
+| `facility`    | `user.role === "admin" && (systemAdmin \|\| (user.facilityId != null && resource.facilityId === user.facilityId))`. A `null` `resource.facilityId` passes **only** for system admins |
+| `sameFacility`| `user.facilityId != null && resource.facilityId === user.facilityId` (staff roster and channel membership, any staff role) |
+| `department`  | `user.departmentId != null && resource.departmentId === user.departmentId` |
+| `userScope`   | `systemAdmin \|\| (facility(target) && target.role ≠ "patient") \|\| (user.role === "admin" && target.role ∈ {doctor, nurse} && target.status === "pending" && target.facilityId === null)`. The last branch is the only null-facility exception for facility admins and exists so they can approve self-signups |
+| `participant` | `conversation.participantIds.includes(user.id)`, or for channels `user.role ∈ {doctor, nurse, admin} && (systemAdmin \|\| sameFacility) && (conversation.departmentId == null \|\| department \|\| user.role === "admin")` |
 | `active`      | `user.status === "active"`. Checked once in middleware |
 
 Patient access levels: `patientAccess(user, patient)` returns one of these values, and every patient-scoped
@@ -970,8 +1108,21 @@ decision uses it:
 
 - `"self"`: the patient's own account.
 - `"clinical"`: a doctor or nurse who passes the `clinical` rule.
-- `"administrative"`: an admin who passes the `facility` rule.
+- `"administrative"`: an admin who passes the `facility` rule. A patient with `facilityId: null` is
+  administrative only for system admins, so a self-registered patient who has never booked is invisible to
+  every facility admin.
 - `null`: no access, which is surfaced as `404`.
+
+**Actor filters.** Several list endpoints filter by another actor: `doctorId` (appointments),
+`prescriberId` (prescriptions), `authorId` (medical records), `performerId` (medication administrations),
+`assigneeId` and `completedBy` (care tasks). A Firestore query cannot be intersected with `careTeam` access,
+so for doctors and nurses these filters accept **only `me` or the caller's own ID**, unless the request also
+has a `patientId` that the caller has `clinical` access to (the query is then patient-scoped, and the actor
+filter only narrows it). Any other value returns `403 forbidden`. Patients can only use `patientId` for
+their own patient (their query is always pinned to their own `patientId`, so an actor filter can only
+narrow their own data). Admins may filter appointments by any `doctorId` whose `facilityId` passes `facility`; admins
+have no access to the other clinical lists. For care tasks, nurses may also use `assigneeId=unassigned` and
+any `assigneeId` of a nurse in their own department, because department scope is applied in the same query.
 
 ### 3.4 Field-level rules
 
@@ -981,12 +1132,16 @@ snapshots.
 | Entity.field                                                          | Visible to |
 | --------------------------------------------------------------------- | ---------- |
 | `Patient.identifier`                                                  | self, administrative |
-| `Patient.{allergies, noKnownAllergies, chronicConditions, bloodType, latestVitals}` | self, clinical |
+| `Patient.{allergies, noKnownAllergies, chronicConditions, bloodType, latestVitals, acuity}` | self, clinical |
+| `Patient.admission`                                                   | self, clinical, administrative (bed management; PII, see [2.5](#25-patient)) |
 | Other `Patient` fields                                                | self, clinical, administrative |
-| `User.{identifier, emergencyContact, phone}`                          | self, admin (facility) |
-| `User.email`                                                          | self, admin. Staff colleagues see email in the directory; patients never do |
+| `User.{identifier, emergencyContact, phone}`                          | self, admin (`userScope`) |
+| `User.email`                                                          | self, admin (`userScope`) |
+| `PractitionerSummary.email`                                           | doctors, nurses and admins. Omitted for patients |
 | `User.lastSignInAt`                                                   | admin |
-| `Appointment.{reason, cancellationReason}`                            | patient (own), doctor, nurse with access. Not admin |
+| `Appointment.{reason, cancellationReason}`                            | self, or a caller with `clinical` access to the appointment's patient. Never admins, and never a nurse who sees the appointment only through department scope |
+| `Shift.handoverNote` (also `previousHandover` in `/shifts/current`)   | the shift owner, and doctors and nurses whose `department` rule passes for the shift. Never admins |
+| Admin `ReportSummary` clinical aggregates                             | small-cell rule in [2.18](#218-reports-aggregation-only-nothing-stored) |
 | `MedicalRecord` with status `preliminary` or `entered-in-error`       | Hidden from the patient: the row is excluded, not just redacted |
 | `Conversation.lastReadAt`                                             | never (replaced by the caller's `unreadCount`) |
 | `legacy`, `nameLower`, `conditionCategories`, `expiresAt`, `schemaVersion` | never |
@@ -997,8 +1152,13 @@ and names the field:
 | Access level     | Writable fields |
 | ---------------- | --------------- |
 | `self`           | `name, givenName, familyName, phone, email, address, emergencyContact`, plus `identifier` only while it is `null` |
-| `clinical`       | `name, givenName, familyName, birthDate, sex, phone, email, address, emergencyContact, bloodType, allergies, noKnownAllergies, chronicConditions, acuity`. Doctors also: `status, deceasedAt`. Staff can set `identifier` **only on `POST /patients`** (write-only) |
-| `administrative` | `name, givenName, familyName, birthDate, sex, phone, email, address, emergencyContact, identifier, facilityId, status` (`inactive` or `active` only) |
+| `clinical`       | `name, givenName, familyName, birthDate, sex, phone, email, address, emergencyContact, folderNumber, bloodType, allergies, noKnownAllergies, chronicConditions, acuity`. Doctors also: `status, deceasedAt`. Staff can set `identifier` **only on `POST /patients`** (write-only) |
+| `administrative` | `name, givenName, familyName, birthDate, sex, phone, email, address, emergencyContact, folderNumber, identifier, status` (`inactive` or `active` only). System admins also: `facilityId` |
+
+`409 duplicate-identifier` on staff `POST /patients` (and on a self `identifier` set) tells the caller that
+some patient with that ID number is already registered, without revealing which. This is an **accepted
+disclosure**: only signed-in staff and the person holding the ID can trigger it, it is needed to prevent
+duplicate records, and the response contains no patient ID or name.
 
 ### 3.5 Denial semantics
 
@@ -1078,8 +1238,8 @@ Status column: **E** existing and unchanged, **C** changed (breaking), **N** new
 | St | Method | Path               | Permission           | Request | Response |
 | -- | ------ | ------------------ | -------------------- | ------- | -------- |
 | C  | GET    | `/me`              | signed in (any status) | – | `{ user: User, patient: Patient \| null, permissions: string[] }`. `404 not-found` means onboarding is needed |
-| C  | POST   | `/me`              | signed in, no profile | `{ name?, phone?, birthDate?, sex? }` | `201` with the same shape as `GET /me` |
-| C  | PATCH  | `/me`              | `profile:update`     | `{ name?, phone?, emergencyContact?, practitioner?: { specialization?, qualifications?, practisingSince?, officeLocation?, bio? } }` | Same shape as `GET /me`. A name change is mirrored to the linked patient |
+| C  | POST   | `/me`              | signed in, no profile | `{ name?, phone?, birthDate?, sex? }` | `201` with the same shape as `GET /me`. Normally creates `users/{uid}` (`role: patient, status: active`) and `patients/{uid}` (`userId` = uid, `phone`/`birthDate`/`sex` from the body, `email` from the token as the initial contact email). **Bootstrap admin:** if the token's email is verified and equals the `BOOTSTRAP_ADMIN_EMAIL` environment variable (trimmed, case-insensitive), the profile is created as `role: admin, status: active, facilityId: null` (a system admin) and no patient document is created. This is the only way to create the first system admin; the existing test stays. `409 conflict` if the profile exists |
+| C  | PATCH  | `/me`              | `profile:update`     | Staff and admins: `{ name?, phone?, emergencyContact?, practitioner?: { specialization?, qualifications?, practisingSince?, officeLocation?, bio? } }`. Patients: `{ name? }` only; `phone` and `emergencyContact` return `403 forbidden` (they live on the Patient, edit them with `PATCH /patients/{patient.id}`) | Same shape as `GET /me`. A name change is mirrored to the linked patient in the same batch |
 | N  | GET    | `/me/preferences`  | `preferences:read`   | – | `UserPreferences` (with defaults filled in) |
 | N  | PATCH  | `/me/preferences`  | `preferences:update` | Partial `UserPreferences` (deep-merged) | `UserPreferences` |
 
@@ -1091,7 +1251,10 @@ Status column: **E** existing and unchanged, **C** changed (breaking), **N** new
 | N  | GET    | `/reports/summary?from=&to=&facilityId=&departmentId=` | `report:read` | `ReportSummary`. `facilityId` is for system admins; `departmentId` is for admins |
 | R  | GET    | `/admin/stats`     | – | Replaced by `GET /dashboard` for admins |
 
-Dashboard shapes (all counts are `count()` aggregations):
+Dashboard shapes. Counts are `count()` aggregations, except the nurse `medicationsDueNow` counter and the
+`overdue-medication` alerts: those come from the medication schedule function in
+[2.9](#29-medicationadministration), computed for today over the caller's accessible inpatients (it is not
+stored, so it cannot be counted with an aggregation).
 
 - `patient`: `{ role, counters: { upcomingAppointments, activePrescriptions, unreadNotifications } }`
 - `doctor`: `{ role, counters: { patients, appointmentsToday, pendingAppointments, preliminaryRecords, activePrescriptions } }`
@@ -1102,15 +1265,13 @@ Dashboard shapes (all counts are `count()` aggregations):
 
 | St | Method | Path                           | Permission          | Request / query | Response |
 | -- | ------ | ------------------------------ | ------------------- | --------------- | -------- |
-| C  | GET    | `/users?role=&status=&facilityId=&departmentId=&q=` | `user:list` | `q` is a case-insensitive prefix match on name | page of `User` (with `lastSignInAt`), sorted by `nameLower` |
-| N  | GET    | `/users/{id}`                  | `user:read`         | – | `User` |
-| C  | PATCH  | `/users/{id}`                  | `user:update`       | `{ role?: "doctor"\|"nurse"\|"admin", status?, statusReason?, facilityId?, departmentId?, practitioner?: Partial<Practitioner> }` | `User`. Activating staff requires `facilityId` (and `departmentId` for nurses, plus `practitioner.licenceNumber`); otherwise `400` |
+| C  | GET    | `/users?role=&status=&facilityId=&departmentId=&q=` | `user:list` | Scoped by `userScope` ([3.3](#33-relationship-and-attribute-rules)): facility admins get their facility's staff and admins plus pending unassigned staff, never `role=patient` (`role=patient` returns `403`); `facilityId` is for system admins. `q` is a case-insensitive prefix match on name | page of `User` (with `lastSignInAt`), sorted by `nameLower` |
+| N  | GET    | `/users/{id}`                  | `user:read`         | – | `User` (`404` outside `userScope`) |
+| C  | PATCH  | `/users/{id}`                  | `user:update`       | `{ role?: "doctor"\|"nurse"\|"admin", status?, statusReason?, facilityId?, departmentId?, practitioner?: Partial<Practitioner> }` | `User`. Activating staff requires `facilityId` (and `departmentId` for nurses, plus `practitioner.licenceNumber`); otherwise `400`. Enforces every invariant in [2.1](#21-user-account): no self-change of `role`/`status`/`facilityId`/`departmentId`; only system admins touch admin accounts, patient accounts, `role: admin` or an admin's `facilityId`; facility admins only manage doctors and nurses in their facility or pending unassigned ones, and may only set `facilityId` to their own; the last active system admin keeps `role`, `status` and `facilityId: null` (`409`). Writes `auditEvents` |
 | R  | GET    | `/doctors`                     | – | – | Replaced by `/practitioners?role=doctor` |
 | N  | GET    | `/practitioners?role=&facilityId=&departmentId=&q=` | `practitioner:list` | Active staff only | page of `PractitionerSummary` (patients: doctors only) |
-| N  | GET    | `/practitioners/{id}/busy?from=&to=` | `practitioner:read-busy` | Window at most 31 days | `{ data: { start, end }[] }` (not paginated, no PHI) |
-| N  | GET    | `/facilities`                  | `facility:read`     | `?status=` (admin) | page of `Facility` |
-| N  | POST   | `/facilities`                  | `facility:manage`   | `Facility` fields | `201 Facility` |
-| N  | PATCH  | `/facilities/{id}`             | `facility:manage`   | partial (`status: "archived"` to archive) | `Facility` |
+| N  | GET    | `/practitioners/{id}/busy?from=&to=` | `practitioner:read-busy` | Window at most 31 days | `{ data: { start, end }[] }`: booked slots merged with `scheduled` `leave` shifts (not paginated, no PHI, no reason why a time is busy) |
+| N  | GET    | `/facilities`                  | `facility:read`     | `?status=` (admin) | page of `Facility`. Facility create and edit are **Deferred** (seed and migration create them) |
 | N  | GET    | `/departments?facilityId=&include=stats` | `department:read` | `include=stats` is admin only | page of `Department` (+ `stats`) |
 | N  | POST   | `/departments`                 | `department:manage` | `Department` fields | `201 Department` |
 | N  | PATCH  | `/departments/{id}`            | `department:manage` | partial | `Department` |
@@ -1119,8 +1280,8 @@ Dashboard shapes (all counts are `count()` aggregations):
 
 | St | Method | Path                                         | Permission                 | Request / query | Response |
 | -- | ------ | -------------------------------------------- | -------------------------- | --------------- | -------- |
-| C  | GET    | `/patients?q=&acuity=&admitted=true`         | `patient:list`             | Sorted by `nameLower` | page of `Patient` (redacted) |
-| C  | POST   | `/patients`                                  | `patient:create`           | `{ name, givenName?, familyName?, birthDate?, sex?, phone?, email?, address?, emergencyContact?, identifier?, bloodType?, allergies?, noKnownAllergies?, chronicConditions?, acuity?, facilityId? (system admin) }` | `201 Patient`. `409 duplicate-identifier` |
+| C  | GET    | `/patients?q=&acuity=&admitted=true&facilityId=` | `patient:list`         | Sorted by `nameLower`. Scope: clinical for doctors and nurses; `facilityId == own` for facility admins; everything (or `facilityId=`) for system admins. `acuity` is not accepted from admins | page of `Patient` (redacted) |
+| C  | POST   | `/patients`                                  | `patient:create`           | `{ name, givenName?, familyName?, birthDate?, sex?, phone?, email?, address?, emergencyContact?, identifier?, folderNumber?, bloodType?, allergies?, noKnownAllergies?, chronicConditions?, acuity?, facilityId? (system admin) }`. Admins may not send the clinical fields (`bloodType`, `allergies`, `noKnownAllergies`, `chronicConditions`, `acuity`) | `201 Patient`. `409 duplicate-identifier` (accepted staff-only disclosure, [3.4](#34-field-level-rules)) |
 | C  | GET    | `/patients/{id}`                             | `patient:read`             | – | `Patient` |
 | C  | PATCH  | `/patients/{id}`                             | `patient:update`           | Partial patient, using the per-access writable set ([3.4](#34-field-level-rules)). `careTeam`, `room` and `nextMed` are no longer accepted | `Patient` |
 | N  | GET    | `/patients/{id}/care-team`                   | `patient:read`             | – | `{ data: PractitionerSummary[] }` (not paginated, at most 50). Patients get it for themselves so they can start a conversation |
@@ -1137,7 +1298,7 @@ Dashboard shapes (all counts are `count()` aggregations):
 
 | St | Method | Path                                          | Permission           | Request / query | Response |
 | -- | ------ | --------------------------------------------- | -------------------- | --------------- | -------- |
-| C  | GET    | `/appointments?patientId=&doctorId=&departmentId=&status=&from=&to=` | `appointment:read` | Default scope: patient (own), doctor (own schedule), nurse (`patientId` or own department), admin (facility). Sorted by `start` asc. `upcoming=true` is replaced by `from=<now>` | page of `Appointment` |
+| C  | GET    | `/appointments?patientId=&doctorId=&departmentId=&status=&from=&to=` | `appointment:read` | Default scope: patient (own), doctor (own schedule), nurse (`patientId` or own department), admin (facility). `doctorId` follows the actor filter rule ([3.3](#33-relationship-and-attribute-rules)): doctors and nurses may pass only `me`/own ID unless `patientId` is set and clinical, admins any doctor in their facility; otherwise `403`. `departmentId` must be the caller's own for nurses. Sorted by `start` asc. `upcoming=true` is replaced by `from=<now>` | page of `Appointment` |
 | C  | POST   | `/appointments`                               | `appointment:create` | `{ doctorId, patientId? (staff), start, durationMinutes?, type?, reason? }` | `201 Appointment`. `409 slot-unavailable` |
 | N  | GET    | `/appointments/{id}`                          | `appointment:read`   | – | `Appointment` |
 | C  | PATCH  | `/appointments/{id}`                          | `appointment:update` | `{ status?, cancellationReason?, start?, durationMinutes?, type?, reason? }`. Transitions per [2.7](#27-appointment). Patients may send only `status: "cancelled"`, `cancellationReason`, `start` and `durationMinutes` | `Appointment`. `409 invalid-state-transition` |
@@ -1146,13 +1307,13 @@ Dashboard shapes (all counts are `count()` aggregations):
 
 | St | Method | Path                                         | Permission                          | Request / query | Response |
 | -- | ------ | -------------------------------------------- | ----------------------------------- | --------------- | -------- |
-| C  | GET    | `/prescriptions?patientId=&prescriberId=&status=&category=` | `prescription:read` | Patients: own. Doctors without `patientId`: `prescriberId = self`. Sorted by `createdAt` desc. Excludes `entered-in-error` unless asked | page of `Prescription` |
+| C  | GET    | `/prescriptions?patientId=&prescriberId=&status=&category=` | `prescription:read` | Patients: own. Doctors without `patientId`: `prescriberId` defaults to and must be `me`/own ID (`403` otherwise); with a clinical `patientId`, any `prescriberId` narrows that patient's list. Sorted by `createdAt` desc. Excludes `entered-in-error` unless asked | page of `Prescription` |
 | C  | POST   | `/prescriptions`                             | `prescription:create`               | `{ patientId, medication, dose, route?, frequency, frequencyText?, administrationTimes?, instructions?, refills?, startDate, endDate?, category?, appointmentId? }` | `201 Prescription` |
 | N  | GET    | `/prescriptions/{id}`                        | `prescription:read`                 | – | `Prescription` |
 | C  | PATCH  | `/prescriptions/{id}`                        | `prescription:update`               | `{ status?, statusReason?, endDate?, refills?, instructions?, administrationTimes? }` | `Prescription` |
 | N  | POST   | `/prescriptions/{id}/refill-requests`        | `prescription:request-refill`       | `{ note? }` (≤500) | `202 { status: "requested" }`. Notifies the prescriber; nothing else is stored (refill workflow **Deferred**) |
 | N  | GET    | `/medication-schedule?date=&departmentId=`   | `medication-schedule:read`          | `date` defaults to today (SAST) | `{ data: ScheduledDose[], prn: Prescription[] }` (not paginated) |
-| N  | GET    | `/medication-administrations?patientId=&prescriptionId=&performerId=&from=&to=` | `medication-administration:read` | At least one of `patientId`, `prescriptionId` or `performerId` (`me` allowed). Sorted by `occurredAt` desc | page of `MedicationAdministration` |
+| N  | GET    | `/medication-administrations?patientId=&prescriptionId=&performerId=&from=&to=` | `medication-administration:read` | At least one of `patientId`, `prescriptionId` (its patient must be clinical or self) or `performerId`. Without a clinical `patientId`/`prescriptionId`, `performerId` must be `me`/own ID (`403` otherwise). Sorted by `occurredAt` desc | page of `MedicationAdministration` |
 | N  | POST   | `/medication-administrations`                | `medication-administration:create`  | `{ prescriptionId, scheduledFor?, status: "completed"\|"not-done", statusReason?, occurredAt?, dose?, notes? }` | `201 MedicationAdministration`. `409 already-charted` |
 | N  | PATCH  | `/medication-administrations/{id}`           | `medication-administration:retract` | `{ status: "entered-in-error", statusReason }` | `MedicationAdministration` |
 
@@ -1160,7 +1321,7 @@ Dashboard shapes (all counts are `count()` aggregations):
 
 | St | Method | Path                                | Permission              | Request / query | Response |
 | -- | ------ | ----------------------------------- | ----------------------- | --------------- | -------- |
-| C  | GET    | `/medical-records?patientId=&authorId=&category=&status=` | `medical-record:read` | Patients: own, final and amended only. Doctors and nurses without `patientId`: `authorId = self`. Sorted by `effectiveAt` desc | page of `MedicalRecord` |
+| C  | GET    | `/medical-records?patientId=&authorId=&category=&status=` | `medical-record:read` | Patients: own, final and amended only. Doctors and nurses without `patientId`: `authorId` defaults to and must be `me`/own ID (`403` otherwise). Sorted by `effectiveAt` desc | page of `MedicalRecord` |
 | C  | POST   | `/medical-records`                  | `medical-record:create` | `{ patientId, category, title, effectiveAt?, status?: "preliminary"\|"final", diagnosis?, diagnosisCode?, findings?, treatment?, recommendations?, labResults?, appointmentId? }` | `201 MedicalRecord` |
 | N  | GET    | `/medical-records/{id}`             | `medical-record:read`   | – | `MedicalRecord` |
 | C  | PATCH  | `/medical-records/{id}`             | `medical-record:update` | While preliminary: content fields and/or `status: "final"`. At any status: `{ status: "entered-in-error", statusReason }` | `MedicalRecord`. `409 record-immutable` |
@@ -1170,14 +1331,14 @@ Dashboard shapes (all counts are `count()` aggregations):
 
 | St | Method | Path                     | Permission         | Request / query | Response |
 | -- | ------ | ------------------------ | ------------------ | --------------- | -------- |
-| N  | GET    | `/care-tasks?assigneeId=&departmentId=&patientId=&status=&priority=&dueBefore=&completedBy=&completedAfter=` | `care-task:read` | `assigneeId` accepts `me` and `unassigned`; `completedBy` accepts `me`. Default for nurses: own department, `status = open,in-progress`. Sorted by `dueAt` asc (by `completedAt` desc when filtering on `completedBy`) | page of `CareTask` |
+| N  | GET    | `/care-tasks?assigneeId=&departmentId=&patientId=&status=&priority=&dueBefore=&completedBy=&completedAfter=` | `care-task:read` | `assigneeId` accepts `me`, `unassigned` and (nurses) a nurse of the caller's own department; `completedBy` accepts only `me`; `departmentId` must be the caller's own. Doctors may use other actor values only with a clinical `patientId`. Anything else returns `403` ([3.3](#33-relationship-and-attribute-rules)). Default for nurses: own department, `status = open,in-progress`. Sorted by `dueAt` asc (by `completedAt` desc when filtering on `completedBy`) | page of `CareTask` |
 | N  | POST   | `/care-tasks`            | `care-task:create` | `{ patientId?, title, description?, category, priority?, dueAt, assigneeId?, departmentId? }` | `201 CareTask` |
 | N  | GET    | `/care-tasks/{id}`       | `care-task:read`   | – | `CareTask` |
 | N  | PATCH  | `/care-tasks/{id}`       | `care-task:update` | `{ status?, assigneeId?, title?, description?, priority?, dueAt?, completionNote? }` | `CareTask`. `409 invalid-state-transition` |
-| N  | GET    | `/shifts?staffId=&departmentId=&from=&to=` | `shift:read` | `staffId` accepts `me`. Window at most 31 days. Sorted by `start` asc | page of `Shift` |
+| N  | GET    | `/shifts?staffId=&departmentId=&from=&to=` | `shift:read` | `staffId` accepts `me`. Window at most 31 days. Scoped to the caller's facility. Sorted by `start` asc. `handoverNote` redacted per [3.4](#34-field-level-rules) | page of `Shift` |
 | N  | GET    | `/shifts/current`        | `shift:read`       | – | `{ shift: Shift \| null, previousHandover: { note, staffName, at } \| null, onDuty: { staffId, staffName, staffRole, type }[] }` (same department, not paginated) |
-| N  | POST   | `/shifts`                | `shift:manage`     | `{ staffId, type, start, end, departmentId? }` | `201 Shift`. `409 conflict` on overlap |
-| N  | PATCH  | `/shifts/{id}`           | `shift:manage` / `shift:handover` | Admin: `{ type?, start?, end?, departmentId?, status? }`. Owner: `{ handoverNote }` | `Shift` |
+| N  | POST   | `/shifts`                | `shift:manage`     | `{ staffId, type, start, end, departmentId? }`. The staff member must be active and in the admin's facility | `201 Shift`. `409 conflict` on overlap. Used by the admin Roster panel |
+| N  | PATCH  | `/shifts/{id}`           | `shift:manage` / `shift:handover` | Admin: `{ type?, start?, end?, departmentId?, status? }` (`status: "cancelled"` to cancel). Owner: `{ handoverNote }` | `Shift` |
 
 #### Notifications
 
@@ -1194,9 +1355,9 @@ Dashboard shapes (all counts are `count()` aggregations):
 | St | Method | Path                                   | Permission           | Request / query | Response |
 | -- | ------ | -------------------------------------- | -------------------- | --------------- | -------- |
 | N  | GET    | `/conversations?type=`                 | `conversation:read`  | Participant conversations, plus channels for staff. Sorted by `lastMessageAt` desc | page of `Conversation` + `unreadCount` |
-| N  | POST   | `/conversations`                       | `conversation:create` (`channel:manage` for channels) | `{ type, participantIds?, title?, patientId?, departmentId? }` | `201 Conversation` (`200` with the existing one for duplicate `direct`) |
+| N  | POST   | `/conversations`                       | `conversation:create` (`channel:manage` for channels) | `{ type, participantIds?, title?, patientId?, departmentId? }`. Type rules in [2.14](#214-conversation-and-message); `patient` conversations: exactly the patient's account plus active care team doctors and nurses, otherwise `403` | `201 Conversation` (`200` with the existing one for duplicate `direct`) |
 | N  | GET    | `/conversations/{id}`                  | `conversation:read`  | – | `Conversation` |
-| N  | PATCH  | `/conversations/{id}`                  | `channel:manage` (channels) / participant (groups: `title` only) | `{ title?, status? }` | `Conversation` |
+| N  | PATCH  | `/conversations/{id}`                  | `channel:manage` (channels) / participant (groups: `title` only) | `{ title?, status? }` (participants cannot be changed in v1) | `Conversation` |
 | N  | GET    | `/conversations/{id}/messages`         | `conversation:read`  | Sorted by `createdAt` desc | page of `Message` |
 | N  | POST   | `/conversations/{id}/messages`         | `message:create`     | `{ text }` | `201 Message`. Updates `lastMessage`, `lastMessageAt` and the sender's `lastReadAt` |
 | N  | POST   | `/conversations/{id}/read`             | `conversation:read`  | – | `204`. Sets `lastReadAt[caller] = now` |
@@ -1208,7 +1369,6 @@ Dashboard shapes (all counts are `count()` aggregations):
 | N  | GET    | `/system-settings`      | `system-settings:read`   | – | `SystemSettings` (with defaults filled in) |
 | N  | PATCH  | `/system-settings`      | `system-settings:update` | Partial (deep-merged) | `SystemSettings` |
 | N  | GET    | `/system-alerts?status=&severity=` | `system-alert:read` | Sorted by `createdAt` desc | page of `SystemAlert` |
-| N  | POST   | `/system-alerts`        | `system-alert:manage`    | `{ title, message, severity, facilityId? }` | `201 SystemAlert` (`source: "manual"`) |
 | N  | PATCH  | `/system-alerts/{id}`   | `system-alert:manage`    | `{ status: "resolved" }` | `SystemAlert` |
 
 ### 4.3 Breaking changes against the current API
@@ -1239,8 +1399,12 @@ Dashboard shapes (all counts are `count()` aggregations):
     Type `record → medical-record`.
 13. `GET /doctors` is replaced by `GET /practitioners?role=doctor`. `GET /admin/stats` is replaced by
     `GET /dashboard`.
-14. Admins lose read access to clinical resources (vitals, prescriptions, medical records) and to
-    appointment `reason`.
+14. Admins lose read access to clinical resources (vitals, prescriptions, medical records), to appointment
+    `reason` and to patient `acuity`. Facility admins no longer see patient accounts or patients without a
+    facility.
+15. For patient accounts, `phone` and `emergencyContact` move from `users/{uid}` to the Patient. `PATCH /me`
+    rejects them for patients.
+16. `GET /practitioners/{id}/busy` also returns leave, and booking enforces opening hours.
 
 ---
 
@@ -1258,7 +1422,10 @@ delete the control or panel: it must not stay as mock data.
 | `Layouts/DashboardLayout.jsx` | – | Already merged on the branch (one layout taking `role`). No data |
 | `Components/Header/Header.jsx` | `GET /notifications/unread-count` | Badge count. `ProfileMenu` uses `user.name` and `user.photoUrl` |
 | `Components/Header/SearchBar.jsx` | navigates only | Staff: submit navigates to the patient list page with `?q=`, which calls `GET /patients?q=`. Admin: to user management with `?q=` |
-| `Components/Sidebar.jsx` | – | Add `Messages` for patients and `Team Chat` for doctors (both routes exist but are not linked). Hide items whose permission is missing |
+| `utils/patients.js` (`toPatientCard`) | – | Read `birthDate` (not `dateOfBirth`), `admission?.room`/`bed` (not `room`), `acuity` (not `priority`), `sex` (not `gender`), and `folderNumber`. Status label comes from `labelFor(acuity)` via `utils/status.js`, not a `critical ? … : …` ternary |
+| `utils/format.js` | – | `healthStatsFromVitals` reads `bloodGlucose` in mmol/L (not `bloodSugar` mg/dL) and formats `bloodPressure` with `formatBloodPressure`. `ageFromDob` takes `birthDate`. Add `formatDateTime`, `formatBloodPressure`, `labelFor` (see 5.9) |
+| `Components/PatientCard/PatientCard.jsx` | – | Props `sex` (replacing `gender`) and `folderNumber`. Show "Folder {folderNumber}" when present instead of the opaque Firestore "ID: {patientId}"; the ID is only used as the React key and link target. `acuity` badge through `StatusBadge` |
+| `Components/Sidebar.jsx` | – | Add `Messages` for patients, `Team Chat` for doctors (both routes exist but are not linked) and `Patients` (`/admin/patients`, new) for admins. Hide items whose permission is missing |
 | `api/client.js` | all | Base URL `${VITE_API_BASE_URL}/v1`. Parse problem+json into `ApiError { status, code, message, errors }`. Add a `listAll`/`paginate` helper using `nextCursor`. One function per endpoint in 4.2 |
 
 ### 5.2 Public pages
@@ -1274,18 +1441,19 @@ delete the control or panel: it must not stay as mock data.
 
 | Component | Endpoints | Fields and behaviour |
 | --------- | --------- | -------------------- |
-| `Components/Settings/Settings.jsx` | `GET`, `PATCH /me/preferences` | `notifications.{inApp,email,sms}`, `language` (en, af, zu, xh), `timeZone` (default Africa/Johannesburg, replacing the US zones), `theme`, `calendarView` (staff only), `listView`. Save button with optimistic state. Security card: "Change password" calls Firebase `sendPasswordResetEmail(user.email)` for password accounts and links to Google account settings for Google accounts. **Remove** 2FA and login history (Deferred) |
-| `Components/ProfilePage/Profile.jsx` + `ProfileCard`, `ProfessionalInformationSection`, `ContactInformationSection`, `ScheduleOverview` | `GET /me` (context), `PATCH /me`, `GET /shifts?staffId=me&from=<today>&to=<+7d>`, patients: `PATCH /patients/{patient.id}` | **Replace the hardcoded "Dr. Sarah Connor".** ProfileCard: `user.name`, `user.photoUrl` (fallback `assets/default-avatar.svg`), title = role label + `practitioner.specialization`. Professional section (staff only): `practitioner.licenceBody`/`licenceNumber`, `specialization`, experience from `practisingSince`, `qualifications[]`, `officeLocation`. Contact section: `user.email`, `user.phone`, `user.emergencyContact`. ScheduleOverview (staff only): upcoming shifts (`type`, `start`–`end`, department). Patients instead see a demographics section: `patient.birthDate`, `sex`, `address`, `emergencyContact`, `identifier` (masked except the last 4 digits). "Edit Profile" opens a form posting to `PATCH /me` (and `PATCH /patients/{id}` for patients) |
+| `Components/Settings/Settings.jsx` | `GET`, `PATCH /me/preferences` | `notifications.{inApp,email,sms}` (email and SMS labelled "not yet delivered"), `language` (en, af, zu, xh; labelled "English only for now"), `timeZone` (default Africa/Johannesburg, replacing the US zones). **Remove** the theme, calendar view and list view controls (not modelled, see [2.15](#215-userpreferences)). Save button with optimistic state. Security card: "Change password" calls Firebase `sendPasswordResetEmail(user.email)` for password accounts and links to Google account settings for Google accounts. **Remove** 2FA and login history (Deferred) |
+| `Components/ProfilePage/Profile.jsx` + `ProfileCard`, `ProfessionalInformationSection`, `ContactInformationSection`, `ScheduleOverview` | `GET /me` (context), `PATCH /me`, `GET /shifts?staffId=me&from=<today>&to=<+7d>`, patients: `PATCH /patients/{patient.id}` | **Replace the hardcoded "Dr. Sarah Connor".** ProfileCard: `user.name`, `user.photoUrl` (fallback `assets/default-avatar.svg`), title = role label + `practitioner.specialization`. Professional section (staff only): `practitioner.licenceBody`/`licenceNumber`, `specialization`, experience from `practisingSince`, `qualifications[]`, `officeLocation`. Contact section: staff and admins read and edit `user.email` (read-only, sign-in), `user.phone`, `user.emergencyContact` through `PATCH /me`. **Patients** read and edit contact data in one place, the Patient: `patient.phone`, `patient.email` (labelled "Contact email"), `patient.emergencyContact`, `address`, through `PATCH /patients/{patient.id}`; `user.email` is shown read-only as "Sign-in email". ScheduleOverview (staff only): upcoming shifts (`type`, `start`–`end`, department). Patients also see a demographics section: `patient.birthDate`, `sex`, `folderNumber`, `identifier` (masked except the last 4 digits). "Edit Profile" opens one form: staff post to `PATCH /me`; patients post `name` to `PATCH /me` and every other field to `PATCH /patients/{patient.id}` |
 | `Components/Notifications/Notifications.jsx` (+ `NotificationList`, `NotificationItem`, `FilterSortControls`, `NotificationIcon`) | `GET /notifications?unread=`, `PATCH /notifications/{id}`, `POST /notifications/read-all` | Filter calls the server with `unread=true` instead of filtering client-side. Sort newest first by default (oldest-first is client-side within loaded pages). "Load more" with `nextCursor`. Click navigates to `resource` when present. Add a "Mark all read" button |
-| `Components/TeamChat/TeamChat.jsx` | `GET /conversations`, `POST /conversations`, `GET /conversations/{id}/messages`, `POST /conversations/{id}/messages`, `POST /conversations/{id}/read`, `GET /practitioners?q=` (new direct message) | Sidebar: channels (`type = channel`), direct and group conversations, and a "Patients" section (`type = patient`) for staff. Header user from `/me`. Poll messages every 15 s while open. **Remove** presence dots, phone and video buttons, emoji and attachments (Deferred) |
+| `Components/TeamChat/TeamChat.jsx` | `GET /conversations`, `POST /conversations`, `GET /conversations/{id}/messages`, `POST /conversations/{id}/messages`, `POST /conversations/{id}/read`, `GET /practitioners?q=` (new direct message) | Sidebar: channels (`type = channel`), direct and group conversations, and a "Patients" section (`type = patient`) for staff. Header user from `/me`. Poll messages every 15 s while open. **Admins** (`can("channel:manage")`) get a "New channel" button (title, optional department from `GET /departments`) posting `POST /conversations { type: "channel" }`, and an "Archive channel" action (`PATCH /conversations/{id} { status: "archived" }`). **Remove** presence dots, phone and video buttons, emoji and attachments (Deferred) |
 
 ### 5.4 Admin (`/admin/*`)
 
 | Route | Component | Endpoints | Fields and behaviour |
 | ----- | --------- | --------- | -------------------- |
-| `dashboard` | `Components/AdminDashboard/AdminDashboard.jsx` | `GET /dashboard`, `GET /shifts?from=<now>&to=<now+1m>` (on duty now), `GET /system-alerts?status=active&limit=5`, `GET /reports/summary` (charts) | StatsGrid: `counters.doctors, nurses, patients, pendingStaff, upcomingAppointments, admittedPatients`. **StaffSchedule** (replaces `MockData.staffSchedule`): `staffName`, shift `type`, "On duty" or "On leave". **SystemAlerts** (replaces `MockData.systemAlerts`): `severity` (info, warning, critical), `title`/`message`, relative `createdAt`, and a resolve button calling `PATCH /system-alerts/{id}`. **Analytics**: render "Patient demographics" (`patients.bySex`, `byAgeGroup`) and "Appointment distribution" (`appointments.byStatus`) from the report summary. **Remove** "Revenue Analytics" and "Resource Utilization". QuickActions become links: pending approvals, add patient, reports, system settings |
+| `dashboard` | `Components/AdminDashboard/AdminDashboard.jsx` | `GET /dashboard`, `GET /shifts?from=<now>&to=<now+1m>` (on duty now), `GET /system-alerts?status=active&limit=5`, `GET /reports/summary` (charts) | StatsGrid: `counters.doctors, nurses, patients, pendingStaff, upcomingAppointments, admittedPatients`. **StaffSchedule** (replaces `MockData.staffSchedule`): `staffName`, shift `type`, "On duty" or "On leave". **SystemAlerts** (replaces `MockData.systemAlerts`): `severity` (info, warning, critical), `title`/`message`, relative `createdAt`, and a resolve button calling `PATCH /system-alerts/{id}`. **Analytics**: render "Patient demographics" (`patients.bySex`, `byAgeGroup`) and "Appointment distribution" (`appointments.byStatus`) from the report summary. **Remove** "Revenue Analytics" and "Resource Utilization". QuickActions become links: pending approvals, patients (`/admin/patients`), reports, system settings |
 | `user-management` | `Components/AdminDashboard/UserManagement.jsx` | `GET /users?role=&status=&q=&cursor`, `GET /users/{id}`, `PATCH /users/{id}`, `GET /departments`, `GET /dashboard` (stat cards) | Replace `mockUsers` and `stats`. Status filter values are `active`, `pending` and `disabled` (not `inactive`). Columns: name, email, role, department (resolved from `departmentId`), status, `lastSignInAt`. Actions: approve (requires facility, department and licence), disable/enable with `statusReason`, change role, view details (drawer showing `identifier`, `emergencyContact`, `practitioner`). Stat cards: `counters.totalUsers, activeUsers, pendingStaff, disabledUsers`. **Remove** "Add New User" (admin invites are Deferred) or replace it with "Copy staff sign-up link" |
-| `department-settings` | `Components/AdminDashboard/DepartmentSettings.jsx` | `GET /departments?include=stats`, `POST /departments`, `PATCH /departments/{id}`, `GET /users?role=doctor,nurse` (head picker) | Replace `mockDepartments` and `overallStats`. Card: `name`, `headName`, `stats.staff`, `bedCapacity`, `stats.admittedPatients`, `stats.occupancyRate`, `stats.appointmentsToday`, `location`. Overall cards: department count, sum of staff, average occupancy (computed client-side). **Remove** budget, equipment and the quick actions except "Assign staff" (link to user management `?departmentId=`). Archive is `PATCH status: archived` |
+| `department-settings` | `Components/AdminDashboard/DepartmentSettings.jsx` | `GET /departments?include=stats`, `POST /departments`, `PATCH /departments/{id}`, `GET /users?role=doctor,nurse` (head picker) | Replace `mockDepartments` and `overallStats`. Card: `name`, `headName`, `stats.staff`, `bedCapacity`, `stats.admittedPatients`, `stats.occupancyRate`, `stats.appointmentsToday`, `location`. Overall cards: department count, sum of staff, average occupancy (computed client-side). **Roster panel** per department (this is the only shift write path, and it feeds the admin StaffSchedule, the nurse ShiftInfo and `onDuty`, the Profile ScheduleOverview and doctor leave in booking): `GET /shifts?departmentId=&from=&to=` for a 7-day window, "Add shift" form (staff picker from `GET /users?departmentId=&status=active&role=doctor,nurse`, `type` including `leave`, `start`, `end`) posting `POST /shifts`, and "Cancel" (`PATCH /shifts/{id} { status: "cancelled" }`). `409 conflict` shows "overlaps an existing shift". **Remove** budget, equipment and the quick actions except "Assign staff" (link to user management `?departmentId=`). Archive is `PATCH status: archived` |
+| `patients` (**new route** in `App.jsx` and the admin sidebar) | `Components/AdminDashboard/AdminPatients.jsx` | `GET /patients?q=&cursor`, `POST /patients`, `PATCH /patients/{id}`, `GET /patients/{id}/care-team`, `POST /patients/{id}/care-team`, `DELETE /patients/{id}/care-team/{userId}`, `GET /practitioners?q=` (care team picker) | Reception and records view for administrative access: register a walk-in patient (demographics, `identifier`, `folderNumber`, no clinical fields), edit demographics or deactivate (`status: inactive`), and manage the care team (add or remove a doctor or nurse). Columns: `name`, `folderNumber`, age, `sex`, `admission` (department, room, bed). No clinical fields are shown. Reuses the shared patient table (`TableHead`, `LoadMore`) with `PatientRecords` |
 | `reports` | `Components/AdminDashboard/AdminReports.jsx`, replaced by the shared `ReportsPage` | `GET /reports/summary?from=&to=&departmentId=` | Route renders the shared reports page (see 5.5). **Delete** the report catalogue, templates, "recent reports" and downloads mock (stored reports are Deferred). Export is client-side CSV |
 | `system-settings` | `Components/AdminDashboard/SystemSettings.jsx` | `GET`, `PATCH /system-settings`, `GET /api/health` (version) | Tabs: General (`organisationName`, `supportEmail`, `supportPhone`, `defaultTimeZone`, `defaultLanguage`, `maintenanceBanner`), Appointments (`appointments.*`), Security (`security.sessionTimeoutMinutes`). Controlled inputs, real Save and Cancel. System status card: API `version` and region only. **Remove** the backup, integrations and maintenance tabs and the fake storage and uptime numbers |
 
@@ -1316,9 +1484,9 @@ delete the control or panel: it must not stay as mock data.
 | Route | Component | Endpoints | Fields and behaviour |
 | ----- | --------- | --------- | -------------------- |
 | `dashboard` | `Components/PatientDashboard/PatientDashboard.jsx` (+ `AppointmentCard`, `PrescriptionsCard`, `NotificationCard`) | `GET /me` (context: `patient.latestVitals`), `GET /appointments?from=<now>&limit=5`, `GET /prescriptions?status=active`, `GET /notifications?unread=true&limit=5` | Health stats: `latestVitals.bloodPressure` (formatted `systolic/diastolic mmHg`), `heartRate`, `weight`, `bloodGlucose` (mmol/L). AppointmentCard: `type`, `start` (formatted in SAST), `doctorName`, `status`. Quick actions become links: book appointment, prescriptions (refill), medical records, messages |
-| `appointments` | `Components/PatientDashboard/UpcomingAppointmentsCard.jsx` (grows into the patient appointments page) | `GET /appointments?from=<now>` (upcoming tab), `GET /appointments?to=<now>` (past tab), `POST /appointments`, `PATCH /appointments/{id}`, `GET /practitioners?role=doctor`, `GET /practitioners/{id}/busy` | Booking form: doctor, date, free 15-minute slots computed from `busy` and the settings, `durationMinutes`, `type`, `reason`. Cancel (with reason) and reschedule while `pending` or `confirmed` |
+| `appointments` | `Components/PatientDashboard/UpcomingAppointmentsCard.jsx` (grows into the patient appointments page) | `GET /appointments?from=<now>` (upcoming tab), `GET /appointments?to=<now>` (past tab), `POST /appointments`, `PATCH /appointments/{id}`, `GET /practitioners?role=doctor`, `GET /practitioners/{id}/busy`, `GET /system-settings` | Booking form: doctor, date (only `appointments.openingHours.days` within `bookingWindowDays` are selectable), and candidate slots = the day's opening hours on 15-minute boundaries, minus `busy` intervals (bookings and leave), minus anything before `now + minLeadTimeMinutes`; then `durationMinutes`, `type`, `reason`. A `409 slot-unavailable` refreshes the slots. Cancel (with reason) and reschedule while `pending` or `confirmed` |
 | `prescriptions` | `Components/PatientDashboard/PatientPrescriptions.jsx` | `GET /prescriptions?status=active`, `GET /prescriptions?status=completed,stopped` (history), `POST /prescriptions/{id}/refill-requests` | Fields: `medication`, `dose`, `frequency`, `instructions`, `startDate`/`endDate`, `refills`, `prescriberName`. "Request refill" is shown for current outpatient prescriptions with `refills > 0` |
-| `medical-records` | `Components/PatientDashboard/MedicalRecords.jsx` | `GET /me` (patient), `GET /patients/{id}/vitals?limit=2` (trend arrows from the previous reading), `GET /prescriptions?status=active`, `GET /appointments?to=<now>&status=completed` (visits), `GET /medical-records?category=&cursor` | Header: `name`, `birthDate`, `bloodType`, `allergies`, `chronicConditions` (replacing "ID: {patient.id}"). Vitals cards with the real trend. Tabs: summary, records (`title`, `category`, `effectiveAt`, `authorName`, `labResults` table, `addenda`), visits, medications. **Remove** "Add Note" and "Order Lab" (staff actions) |
+| `medical-records` | `Components/PatientDashboard/MedicalRecords.jsx` | `GET /me` (patient), `GET /patients/{id}/vitals?limit=2` (trend arrows from the previous reading), `GET /prescriptions?status=active`, `GET /appointments?to=<now>&status=completed` (visits), `GET /medical-records?category=&cursor` | Header: `name`, `folderNumber` (when present), `birthDate`, `bloodType`, `allergies`, `chronicConditions` (replacing "ID: {patient.id}"). Vitals cards with the real trend. Tabs: summary, records (`title`, `category`, `effectiveAt`, `authorName`, `labResults` table, `addenda`), visits, medications. **Remove** "Add Note" and "Order Lab" (staff actions) |
 | `messages` | `Components/PatientDashboard/Messages.jsx` | `GET /conversations?type=patient`, `POST /conversations` (`type: patient`), `GET /patients/{id}/care-team` (recipient picker), conversation message endpoints | **Rewrite**: it is currently a staff-side "Patient Messages" mock. The patient sees their conversations with their care team: `title`/participants, `lastMessage`, `unreadCount`, and a thread with a composer. **Remove** stats, quick responses and attachments (Deferred). The staff side of these conversations lives in TeamChat's "Patients" section |
 | `settings`, `notifications`, `profile` | shared | see 5.3 | |
 
@@ -1383,21 +1551,24 @@ Script: `scripts/migrate-v1.js`.
   <id>` is passed with matching values. **Agents only run it against the emulator.** The production run is
   done by the owner.
 - Removed or renamed source fields are copied to `legacy.<field>` before deletion (`FieldValue.delete()`).
-  Every migrated document gets `schemaVersion: 2`. `updatedAt` and `updatedBy` are set to `"system"` if
-  missing.
+  Every migrated document gets `schemaVersion: 2`, `updatedAt = now` and `updatedBy = "system"`. Each
+  migrated document also gets an `auditEvents` entry (`actorId: "system"`, `action: "update"`,
+  `changedFields` = the renamed or added fields).
 
 | Collection | Transform |
 | ---------- | --------- |
 | `facilities` (new) | If none exist, create `facilities/default` `{ name: "CureCloud Demo Hospital", type: "hospital", status: "active" }`. Override with `--default-facility-name` |
-| `users` | `phoneNumber → phone` (normalized E.164). `nationalId → identifier` (`za-id` if 13 digits passing Luhn, otherwise `other`). `specialization → practitioner.specialization` for doctors and nurses (and `practitioner.licenceBody` from role). Staff with `facilityId: null` get `default`. Add `departmentId: null`, `nameLower`, `updatedAt`/`updatedBy`/`createdBy` (`createdBy` = own UID). Admins keep `facilityId: null` (system admins) |
-| `patients` | `dateOfBirth → birthDate`. `priority → acuity`. `vitals → latestVitals` (with the vitals transform below). `room` → if non-null, `admission: { departmentId: null, departmentName: "Unassigned", room, admittedAt: createdAt, admittedBy: "system" }`, otherwise `admission: null`. `nextMed → legacy.nextMed`. Add `status: "active"`, `sex: "unknown"`, `allergies: []`, `noKnownAllergies: false`, `chronicConditions: []`, `conditionCategories: []`, `identifier: null`, `facilityId` (`default` if the care team is non-empty, else `null`), `nameLower`, and `phone`/`email` copied from the linked user |
+| `users` | `phoneNumber → phone` (normalized E.164). `nationalId → identifier` (`za-id` if 13 digits passing Luhn, otherwise `other`). `specialization → practitioner.specialization` for doctors and nurses (and `practitioner.licenceBody` from role). Staff with `facilityId: null` get `default`. Add `departmentId: null`, `nameLower`, `createdBy` (own UID). Admins keep `facilityId: null` (system admins); admins with a stray `practitioner` or `specialization` get it moved to `legacy`. For `role: patient`: `phone` and `emergencyContact` move to the linked patient (only where the patient field is empty) and the user copies go to `legacy` |
+| `patients` | `dateOfBirth → birthDate`. `priority → acuity`. `vitals → latestVitals` (with the vitals transform below). `room` → if non-null, `admission: { departmentId: null, departmentName: "Unassigned", room, admittedAt: createdAt, admittedBy: "system" }`, otherwise `admission: null`. `nextMed → legacy.nextMed`. Add `status: "active"`, `sex: "unknown"`, `allergies: []`, `noKnownAllergies: false`, `chronicConditions: []`, `conditionCategories: []`, `identifier: null`, `folderNumber: null`, `facilityId` (`default` if the care team is non-empty, else `null`), `nameLower`, and `email` (contact email, initialised from the linked user's sign-in email). `phone`/`emergencyContact` come from the user transform above |
 | `patients/*/vitals` | `bloodPressure "120/80"` → `{ systolic: 120, diastolic: 80 }`. `bloodSugar` (mg/dL) → `bloodGlucose = round(bloodSugar / 18, 1)` mmol/L, original kept in `legacy.bloodSugar`. Add `status: "final"`, `createdBy = recordedBy`, `createdByName` (looked up), `patientId` |
 | `appointments` | `scheduledAt → start`. `end = start + 30 min`, `durationMinutes: 30`. `date`, `time → legacy`. `notes → reason`. `type` map: "General Checkup" → `check-up`, "Follow-up" → `follow-up`, "Consultation" → `consultation`, anything else → `other` (original in `legacy.type`). Add `facilityId`/`departmentId` from the doctor (`default` facility fallback) and `updatedBy`. Statuses are unchanged |
 | `appointmentSlots` | Add `{ doctorId, start }` fields to existing locks. For active appointments, `create()` the second 15-minute lock (`start + 15 min`) if missing. Grandfathered appointments not on a 15-minute boundary keep their single legacy lock |
 | `prescriptions` | `doctorId/doctorName → prescriberId/prescriberName`. `dosage → dose`. `notes → instructions`. `frequency` map: "Once daily" → `once-daily`, "Twice daily" → `twice-daily`, "Three times daily" → `three-times-daily`, "Four times daily" → `four-times-daily`, "As needed" → `as-needed`, "At night" → `at-night`, anything else → `custom` with `frequencyText` = the original and `administrationTimes: ["08:00"]`. Add `route: "oral"`, `category: "outpatient"`, `administrationTimes` (defaults per frequency). Status `discontinued → stopped` |
 | `medicalRecords` | `doctorId/doctorName → authorId/authorName`, add `authorRole: "doctor"`. `type → title`, plus `category` by keyword: "blood", "lab", "test" → `lab-result`; "x-ray", "scan", "mri", "ct" → `imaging`; otherwise `consultation`. `results → findings`. Add `effectiveAt = createdAt`, `labResults: []`, `addenda: []` |
 | `notifications` | `type: "record" → "medical-record"`. Add `readAt` (`updatedAt` or `null`), `resource: null`, `expiresAt = createdAt + 90 days` |
-| `systemSettings`, `userPreferences`, `systemAlerts`, `departments`, `careTasks`, `shifts`, `medicationAdministrations`, `conversations` | New and empty. No migration (defaults are applied on read) |
+| `patientIdentifiers` | Not present before v1 (no identifiers were stored on patients). Created by the API with the HMAC key |
+| `userPreferences` | Drop `theme`, `calendarView`, `listView` to `legacy` if any document has them |
+| `systemSettings`, `systemAlerts`, `departments`, `careTasks`, `shifts`, `medicationAdministrations`, `conversations`, `auditEvents` | New and empty. No migration (defaults are applied on read) |
 
 Deploy order (owner): deploy the new indexes first and wait until they are built. Then run the migration
 dry run, then `--apply`, then deploy the functions and Hosting together. The old `scheduledAt` and
@@ -1417,8 +1588,11 @@ Explicitly out of scope for this iteration. The UI hides or removes these contro
 - Email and SMS delivery of notifications. Appointment reminder jobs (Cloud Scheduler).
 - The Firestore TTL policy on `notifications.expiresAt`. This is a one-off ops step:
   `gcloud firestore fields ttls update expiresAt --collection-group=notifications`.
-- Admin-created staff invites (`POST /users`), MFA, login history, a per-read access audit log, and
-  break-glass emergency access.
+- Admin-created staff invites (`POST /users`), MFA, login history, a per-read access audit log, an
+  `auditEvents` read API, and break-glass emergency access.
+- Facility management (`POST`/`PATCH /facilities`) and per-facility settings such as opening hours.
+  Manually raised system alerts (`POST /system-alerts`).
+- Dark theme, and theme, calendar view and list view preferences.
 - A coded drug catalogue (SAMF / NAPPI), drug interaction checks, a refill approval workflow, and automatic
   prescription completion.
 - Lab orders ("Order Lab"), imaging attachments, and file storage.
@@ -1437,8 +1611,15 @@ Explicitly out of scope for this iteration. The UI hides or removes these contro
 Backend layout:
 
 - `src/lib/policy.js` (section 3) and `src/lib/problem.js` (`HttpProblem` + error handler).
-- `src/lib/pagination.js` (cursor encode, decode, page) and `src/lib/dates.js` (SAST helpers, slot
-  alignment).
+- `src/lib/pagination.js` (cursor encode and decode of `[...orderByValues, id]`, page) and `src/lib/dates.js`
+  (SAST helpers, slot alignment, opening hours check).
+- `src/lib/route.js`: `defineRoute(router, { method, path, permission, request, responses })`, which mounts
+  the handler and registers the OpenAPI operation from the same call ([1.11](#111-api-documentation-openapi--swagger)).
+- `src/lib/audit.js`: `writeAudit(txOrBatch, actor, { action, resource, patientId?, changedFields })`, which
+  adds an `auditEvents` document to the caller's transaction or batch and never writes on its own
+  ([2.20](#220-auditevent)). `changedFields` is computed from the validated patch keys, never from values.
+- `src/lib/identifiers.js`: HMAC-SHA256 of `"{type}:{value}"` with `PATIENT_IDENTIFIER_KEY`
+  (`defineSecret`; `demo-identifier-key` under the emulator).
 - `src/schemas/*.js`: zod entity, request and response schemas, registered in an OpenAPI registry.
 - `src/routes/v1/*.js`: one router per resource. `src/openapi.js` builds the document.
 
@@ -1449,10 +1630,31 @@ as `notify()` does today.
 
 Tests:
 
-- `test/policy.test.js`: pure unit tests of the matrix, the relationship rules and redaction.
+- `test/policy.test.js`: pure unit tests of the matrix, the relationship rules and redaction. It covers the
+  null cases: `facility` and `department` are false when both sides are `null`; a patient never passes
+  `facility` or channel `participant`; a facility admin does not see a patient or user with
+  `facilityId: null` (except pending staff).
 - Integration tests per resource against the emulators, including at least one test per denial type in
   [3.5](#35-denial-semantics) and per state machine.
-- An OpenAPI coverage test.
+- Required denial tests for account control (`PATCH /users/{id}`):
+  - a facility admin cannot change their own `facilityId` (to `null` or another facility), `role` or
+    `status` (`403`);
+  - a facility admin cannot modify a system admin, grant `role: admin`, or clear an admin's `facilityId`
+    (`403` or `404`);
+  - a system admin cannot move the last active system admin to a facility (`409`), demote or disable it
+    (`409`).
+- Required denial tests for actor filters: a doctor calling `GET /prescriptions?prescriberId=<colleague>`
+  and a nurse calling `GET /medication-administrations?performerId=<colleague>` without a clinical
+  `patientId` get `403`.
+- Required denial tests for patient conversations: a patient creating a `patient` conversation that
+  includes another patient's account or staff not on their care team gets `403`.
+- Booking outside `openingHours` and during a doctor's `leave` shift returns `409 slot-unavailable`.
+- `PATCH /me` with `phone` as a patient returns `403`.
+- An audit test: a patient `PATCH` of `allergies` writes exactly one `auditEvents` document with
+  `changedFields: ["allergies"]` and no values.
+- The bootstrap admin test (existing) stays.
+- An OpenAPI coverage test (route list from `defineRoute` against the spec) and the index coverage test
+  in [2.19](#219-index-summary).
 
 Frontend:
 
