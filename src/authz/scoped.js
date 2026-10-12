@@ -94,6 +94,7 @@ export const scoped = {
       const p = actor(user, prescriberId, { patientScoped: user.role !== "patient" });
       if (p) where.push(["prescriberId", "==", p]);
     } else if (user.role === "patient") throw forbidden();
+    else if (user.role === "nurse") throw badRequest("patientId is required");
     else where.push(["prescriberId", "==", actor(user, prescriberId ?? "me")]);
     where.push(eq("status", status ?? LIVE_PRESCRIPTION));
     if (category) where.push(["category", "==", category]);
@@ -179,6 +180,7 @@ export const scoped = {
   // Shifts are at most 24h long, so start ∈ [from − 24h, to) plus end > from in memory is exact.
   // ctx.staffId / ctx.departmentId: values the route verified are in the caller's facility.
   shifts(user, { staffId, departmentId, facilityId, from, to }, ctx = {}) {
+    if (facilityId && !systemAdmin(user)) throw forbidden("facilityId is for system administrators");
     const where = [];
     if (staffId) {
       const s = staffId === "me" ? user.id : staffId;
@@ -188,9 +190,9 @@ export const scoped = {
       if (ctx.departmentId !== departmentId) throw forbidden();
       where.push(["departmentId", "==", departmentId]);
     } else if (systemAdmin(user)) {
-      if (facilityId) where.push(["facilityId", "==", facilityId]);
+      if (!facilityId) throw badRequest("System administrators must pass facilityId, departmentId or staffId=me");
+      where.push(["facilityId", "==", facilityId]);
     } else if (user.facilityId) {
-      if (facilityId && facilityId !== user.facilityId) throw forbidden();
       where.push(["facilityId", "==", user.facilityId]);
     } else where.push(["staffId", "==", user.id]);
     where.push(["start", ">=", new Date(from.getTime() - DAY)], ["start", "<", to]);
@@ -285,14 +287,15 @@ export const scoped = {
     });
   },
 
+  // Alerts hold no PHI, so facility admins also read system-wide (facilityId null) alerts (§2.17).
   systemAlerts(user, { status, severity } = {}) {
+    const where = [status && eq("status", status), severity && eq("severity", severity)];
+    const orderBy = [["createdAt", "desc", ts]];
+    if (systemAdmin(user)) return spec("systemAlerts", { where, orderBy });
     return spec("systemAlerts", {
-      where: [
-        !systemAdmin(user) && ["facilityId", "==", user.facilityId],
-        status && eq("status", status),
-        severity && eq("severity", severity),
-      ],
-      orderBy: [["createdAt", "desc", ts]],
+      where,
+      or: [[["facilityId", "==", user.facilityId]], [["facilityId", "==", null]]],
+      orderBy,
     });
   },
 
@@ -386,6 +389,7 @@ export function dashboardSpecs(user, now, { ownPatientId, startOfDay, endOfDay }
     ...(unassignedPending && { pendingUnassigned: count("users", unassignedPending) }),
     upcomingAppointments: count("appointments", [facility, eq("status", upcoming), ["start", ">=", now]]),
     activeSystemAlerts: count("systemAlerts", [facility, ["status", "==", "active"]]),
+    ...(facility && { systemWideAlerts: count("systemAlerts", [["facilityId", "==", null], ["status", "==", "active"]]) }),
     totalUsers: users(),
     activeUsers: users(["status", "==", "active"]),
     disabledUsers: users(["status", "==", "disabled"]),

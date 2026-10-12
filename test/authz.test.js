@@ -24,6 +24,7 @@ describe("authorization", () => {
     u.d2 = await staffUser("d2@curecloud.test", "doctor", { name: "Doctor Two", facilityId: "f1", departmentId: "ward2" });
     u.n1 = await staffUser("n1@curecloud.test", "nurse", { name: "Nurse One", facilityId: "f1", departmentId: "ward1" });
     u.n2 = await staffUser("n2@curecloud.test", "nurse", { name: "Nurse Two", facilityId: "f1", departmentId: "ward2" });
+    u.d3 = await staffUser("d3@curecloud.test", "doctor", { name: "Doctor Three", facilityId: "f2", departmentId: "wardX" });
     u.pending = await staffUser("pending@curecloud.test", "nurse", { name: "Pending Nurse", status: "pending" });
     u.p = await googleUser("p@gmail.test", "Patient Pat");
     u.q = await googleUser("q@gmail.test", "Patient Quinn");
@@ -140,9 +141,11 @@ describe("authorization", () => {
       const acuity = await as(u.p.token).patch(`/patients/${ids.p}`, { acuity: "critical" }).expect(403);
       assert.match(acuity.body.detail, /acuity/);
       await as(u.p.token).patch(`/patients/${ids.p}`, { phone: "0831234567", address: { line1: "1 Main Rd", city: "Soweto", province: "gauteng", postalCode: "1818" } }).expect(200);
-      await as(u.p.token).patch(`/patients/${ids.p}`, { identifier: { type: "passport", value: "A1234567", country: "ZW" } }).expect(200);
-      // identifier is writable for self only while it is unset
-      await as(u.p.token).patch(`/patients/${ids.p}`, { identifier: { type: "passport", value: "B1234567", country: "ZW" } }).expect(403);
+      // Patients never set their own identifier (it would be unverified); administrative access does.
+      const selfId = await as(u.p.token).patch(`/patients/${ids.p}`, { identifier: { type: "passport", value: "A1234567", country: "ZW" } }).expect(403);
+      assert.match(selfId.body.detail, /identifier/);
+      await as(u.admin.token).patch(`/patients/${ids.p}`, { identifier: { type: "passport", value: "A1234567", country: "ZW" } }).expect(200);
+      await as(u.d1.token).patch(`/patients/${ids.p}`, { identifier: { type: "passport", value: "B1234567", country: "ZW" } }).expect(403);
       const allergies = await as(u.admin.token).patch(`/patients/${ids.w}`, { allergies: [] }).expect(403);
       assert.match(allergies.body.detail, /allergies/);
       await as(u.admin.token).patch(`/patients/${ids.w}`, { status: "deceased", deceasedAt: "2026-10-01" }).expect(403);
@@ -317,6 +320,36 @@ describe("authorization", () => {
       const unread = await as(u.p.token).get("/conversations").expect(200);
       assert.equal(unread.body.data[0].unreadCount, 1);
       assert.equal(unread.body.data[0].lastReadAt, undefined);
+    });
+  });
+
+  describe("facility consistency", () => {
+    test("a user's department always belongs to their facility", async () => {
+      const foreign = await as(u.admin.token).patch(`/users/${u.n1.uid}`, { departmentId: "wardX" }).expect(400);
+      assert.equal(foreign.body.code, "validation-error");
+      // A facility move must set or clear the department in the same request.
+      const stale = await as(u.sys.token).patch(`/users/${u.d3.uid}`, { facilityId: "f1" }).expect(400);
+      assert.match(stale.body.detail, /departmentId/);
+      await as(u.sys.token).patch(`/users/${u.d3.uid}`, { facilityId: "f1", departmentId: "wardX" }).expect(400);
+    });
+
+    test("admission, care team and staff bookings stay inside the patient's facility", async () => {
+      await as(u.d1.token).post(`/patients/${ids.p}/admission`, { departmentId: "wardX" }).expect(400);
+      await as(u.d1.token).post(`/patients/${ids.p}/care-team`, { userId: u.d3.uid }).expect(400);
+      await as(u.admin.token).post(`/patients/${ids.p}/care-team`, { userId: u.d3.uid }).expect(400);
+      const booked = await as(u.admin.token).post("/appointments", { patientId: ids.p, doctorId: u.d3.uid, start: weekdaySlot(8, "10:00") }).expect(400);
+      assert.match(booked.body.detail, /facility/);
+    });
+
+    test("conversations take the participants' facility", async () => {
+      await as(u.admin.token).post("/conversations", { type: "channel", title: "X", departmentId: "wardX" }).expect(400);
+      await as(u.sys.token).post("/conversations", { type: "channel", title: "Everyone" }).expect(400);
+      const channel = await as(u.sys.token).post("/conversations", { type: "channel", title: "F2 news", facilityId: "f2" }).expect(201);
+      assert.equal(channel.body.facilityId, "f2");
+      const direct = await as(u.sys.token).post("/conversations", { type: "direct", participantIds: [u.d1.uid] }).expect(201);
+      assert.equal(direct.body.facilityId, "f1");
+      await as(u.sys.token).post("/conversations", { type: "group", title: "Mixed", participantIds: [u.d1.uid, u.d3.uid] }).expect(403);
+      await as(u.d1.token).post("/conversations", { type: "direct", participantIds: [u.d3.uid] }).expect(403);
     });
   });
 

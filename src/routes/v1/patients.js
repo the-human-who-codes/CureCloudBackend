@@ -220,7 +220,7 @@ export function register(router) {
     permission: "patient:update",
     summary: "Update a patient using the caller's writable field set",
     description:
-      "self: name, contact data, and identifier while it is unset. clinical: demographics and clinical fields (doctors also status). administrative: demographics, identifier and active/inactive status (system admins also facilityId). Any other field returns 403 naming it.",
+      "self: name and contact data (never identifier). clinical: demographics and clinical fields (doctors also status). administrative: demographics, identifier and active/inactive status (system admins also facilityId). Any other field returns 403 naming it.",
     tags: ["Patients"],
     request: { params: idParam, body: PatientUpdateRequest },
     responses: { 200: Patient },
@@ -303,7 +303,8 @@ export function register(router) {
     path: "/patients/{id}/care-team",
     permission: "patient:manage-care-team",
     summary: "Add a doctor or nurse to the care team",
-    description: "Doctors may add while they are on the care team; admins within their facility. Notifies the added staff member.",
+    description:
+      "Doctors may add while they are on the care team; admins within their facility. The added doctor or nurse must be in the patient's facility (or the caller's while that is unset); only system admins may add staff of another facility. Notifies the added staff member.",
     tags: ["Patients"],
     request: { params: idParam, body: CareTeamAddRequest },
     responses: { 201: PractitionerSummaryList },
@@ -317,6 +318,11 @@ export function register(router) {
       const staff = await getDoc("users", userId);
       if (!["doctor", "nurse"].includes(staff?.role) || staff.status !== "active") {
         throw badRequest("userId must be an active doctor or nurse");
+      }
+      // Cross-facility referral is deferred: only system admins may add staff of another facility.
+      const facilityId = patient.facilityId ?? user.facilityId ?? null;
+      if (!systemAdmin(user) && staff.facilityId !== facilityId) {
+        throw badRequest("userId must be a member of the patient's facility");
       }
       if (!patient.careTeam.includes(userId)) {
         if (patient.careTeam.length >= 50) throw conflict("The care team is full (50 members)");
@@ -371,6 +377,8 @@ export function register(router) {
     path: "/patients/{id}/admission",
     permission: "patient:admit",
     summary: "Admit the patient (doctors and admins)",
+    description:
+      "departmentId must be an active department of the patient's facility (or of the caller's facility while the patient has none, which the admission then sets). 409 if already admitted.",
     tags: ["Patients"],
     request: { params: idParam, body: AdmitRequest },
     responses: { 201: Patient },
@@ -382,12 +390,10 @@ export function register(router) {
       if (user.role === "nurse") throw forbidden("Nurses can only move a patient's ward, room or bed");
       const body = req.valid.body;
       const dept = await loadDepartment(body.departmentId);
-      if (patient.facilityId && dept.facilityId !== patient.facilityId) {
-        throw badRequest("The department is in another facility");
-      }
-      if (user.role === "admin" && !systemAdmin(user) && dept.facilityId !== user.facilityId) {
-        throw badRequest("The department is in another facility");
-      }
+      // The department must be in the patient's facility; while that is unset (a self-registered
+      // patient who never booked), in the caller's facility, and the admission sets it (§2.5).
+      const facilityId = patient.facilityId ?? (systemAdmin(user) ? dept.facilityId : user.facilityId);
+      if (dept.facilityId !== facilityId) throw badRequest("The department is in another facility");
       await checkAttendingDoctor(body.attendingDoctorId);
       const ref = patients.doc(patientId);
       await db.runTransaction(async (tx) => {

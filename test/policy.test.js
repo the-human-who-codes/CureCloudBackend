@@ -96,7 +96,7 @@ describe("role permission matrix (§3.2)", () => {
     "care-task:update": "nd",
     "shift:read": "nda",
     "shift:manage": "a",
-    "shift:handover": "nda",
+    "shift:handover": "nd",
     "notification:read": "pnda",
     "notification:update": "pnda",
     "conversation:read": "pnda",
@@ -168,6 +168,8 @@ describe("relationship rules (§3.3)", () => {
     assert.equal(patientAccess(sysAdmin, selfRegistered), "administrative");
     // A nurse without a department has no ward access.
     assert.equal(clinical({ ...nurse, departmentId: null }, patient), false);
+    // ward also requires the patient's facility to be the nurse's (defence in depth).
+    assert.equal(clinical({ ...nurse, facilityId: "f2" }, patient), false);
   });
 
   test("userScope", () => {
@@ -237,9 +239,33 @@ describe("authorize denial semantics (§3.5)", () => {
     const task = { departmentId: "ward1", assigneeId: null, createdBy: "x", patientId: "p1" };
     assert.equal(can(nurse, "care-task:read", task, { patient }), true);
     assert.equal(can(otherNurse, "care-task:read", task, { patient }), false);
-    assert.equal(can(otherNurse, "care-task:read", { ...task, assigneeId: "n2" }, { patient }), true);
+    // Patient tasks always need clinical access: assignment alone is not enough.
+    assert.equal(can(otherNurse, "care-task:read", { ...task, assigneeId: "n2" }, { patient }), false);
     assert.equal(can(doctor, "care-task:read", task, { patient }), true);
     assert.equal(can({ ...doctor, id: "d3" }, "care-task:read", task, { patient }), false);
+    // A discharged patient's task disappears for the ward nurse, but not for the care team.
+    const discharged = { ...patient, admission: null };
+    assert.equal(can(nurse, "care-task:read", task, { patient: discharged }), false);
+    assert.equal(can(doctor, "care-task:update", task, { patient: discharged }), true);
+    // Ward-level tasks: department, assignee or creator for nurses; creator for doctors.
+    const wardTask = { departmentId: "ward1", assigneeId: null, createdBy: "d1", patientId: null };
+    assert.equal(can(nurse, "care-task:read", wardTask, {}), true);
+    assert.equal(can(otherNurse, "care-task:read", wardTask, {}), false);
+    assert.equal(can(otherNurse, "care-task:update", { ...wardTask, assigneeId: "n2" }, {}), true);
+    assert.equal(can(doctor, "care-task:update", wardTask, {}), true);
+    assert.equal(can({ ...doctor, id: "d3" }, "care-task:read", wardTask, {}), false);
+  });
+
+  test("handover notes and system alerts", () => {
+    const shift = { staffId: "n1", staffRole: "nurse", facilityId: "f1", departmentId: "ward1" };
+    assert.equal(can(nurse, "shift:handover", shift), true);
+    assert.equal(can(otherNurse, "shift:handover", shift), false);
+    assert.equal(can(facilityAdmin, "shift:handover", { ...shift, staffId: "a1", staffRole: "admin" }), false);
+    // Every admin reads system-wide alerts; facility alerts only within the facility.
+    assert.equal(can(facilityAdmin, "system-alert:read", { facilityId: null }), true);
+    assert.equal(can(facilityAdmin, "system-alert:manage", { facilityId: "f1" }), true);
+    assert.equal(can(otherAdmin, "system-alert:read", { facilityId: "f1" }), false);
+    assert.equal(can(doctor, "system-alert:read", { facilityId: null }), false);
   });
 });
 
@@ -302,8 +328,9 @@ describe("writable patient fields (§3.4)", () => {
   test("per access level", () => {
     const self = writableFields(patientUser, "patient", patient);
     assert.ok(self.has("phone") && self.has("emergencyContact"));
-    assert.ok(!self.has("acuity") && !self.has("identifier")); // identifier already set
-    assert.ok(writableFields(patientUser, "patient", { ...patient, identifier: null }).has("identifier"));
+    // A self-asserted ID number is never accepted, set or not.
+    assert.ok(!self.has("acuity") && !self.has("identifier"));
+    assert.ok(!writableFields(patientUser, "patient", { ...patient, identifier: null }).has("identifier"));
     const nurseFields = writableFields(nurse, "patient", patient);
     assert.ok(nurseFields.has("allergies") && !nurseFields.has("status") && !nurseFields.has("identifier"));
     assert.ok(writableFields(doctor, "patient", patient).has("status"));
@@ -333,6 +360,18 @@ describe("scoped builders and actor filters (§3.3)", () => {
     assert.equal(code(() => scoped.medicationAdministrations(nurse, { performerId: "n2" }, { patientId: "p1" })), "ok");
     assert.equal(code(() => scoped.appointments(doctor, { doctorId: "d2" })), "403");
     assert.equal(code(() => scoped.appointments(nurse, { departmentId: "ward2" })), "403");
+    // Nurses never prescribe, so their prescription lists must be patient-scoped.
+    assert.equal(code(() => scoped.prescriptions(nurse, {})), "400");
+    assert.equal(code(() => scoped.prescriptions(nurse, {}, { patientId: "p1" })), "ok");
+  });
+
+  test("shift lists: system admins name a facility; facilityId is theirs alone", () => {
+    const window = { from: new Date("2026-10-12T00:00:00Z"), to: new Date("2026-10-13T00:00:00Z") };
+    assert.equal(code(() => scoped.shifts(sysAdmin, window)), "400");
+    assert.equal(code(() => scoped.shifts(sysAdmin, { ...window, facilityId: "f2" })), "ok");
+    assert.equal(code(() => scoped.shifts(sysAdmin, { ...window, staffId: "me" })), "ok");
+    assert.equal(code(() => scoped.shifts(facilityAdmin, { ...window, facilityId: "f1" })), "403");
+    assert.deepEqual(scoped.shifts(facilityAdmin, window).where[0], ["facilityId", "==", "f1"]);
   });
 
   test("lists are pinned to the caller's scope", () => {

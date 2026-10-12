@@ -64,17 +64,24 @@ const RULES = {
   "medical-record:create": (u, _r, { patient }) => clinical(u, patient),
   "medical-record:update": (u, r) => r.authorId === u.id,
 
-  "care-task:read": (u, t, { patient } = {}) =>
-    u.role === "nurse"
-      ? department(u, t) || t.assigneeId === u.id || t.createdBy === u.id
-      : t.createdBy === u.id || clinical(u, patient),
+  // Patient tasks always need clinical access to the task's patient at request time (§2.10), on
+  // top of the department, assignee or creator scope. Ward-level tasks have no patient.
+  "care-task:read": (u, t, { patient } = {}) => {
+    if (t.patientId && !clinical(u, patient)) return false;
+    if (u.role === "nurse") return department(u, t) || t.assigneeId === u.id || t.createdBy === u.id;
+    return Boolean(t.patientId) || t.createdBy === u.id;
+  },
   "care-task:create": (u, _t, { patient } = {}) => !patient || clinical(u, patient),
-  "care-task:update": (u, t, { patient } = {}) =>
-    u.role === "nurse" ? department(u, t) || t.assigneeId === u.id : t.createdBy === u.id || clinical(u, patient),
+  "care-task:update": (u, t, { patient } = {}) => {
+    if (t.patientId && !clinical(u, patient)) return false;
+    if (u.role === "nurse") return department(u, t) || t.assigneeId === u.id;
+    return Boolean(t.patientId) || t.createdBy === u.id;
+  },
 
   "shift:read": (u, s) => s.staffId === u.id || sameFacility(u, s) || systemAdmin(u),
   "shift:manage": (u, s) => facility(u, s),
-  "shift:handover": (u, s) => s.staffId === u.id,
+  // Handover notes are PHI: only on doctor and nurse shifts, by their owner.
+  "shift:handover": (u, s) => s.staffId === u.id && ["doctor", "nurse"].includes(s.staffRole),
 
   "notification:read": (u, n) => n.userId === u.id,
   "notification:update": (u, n) => n.userId === u.id,
@@ -89,8 +96,8 @@ const RULES = {
   "department:read": (u, d) => systemAdmin(u) || sameFacility(u, d),
   "department:manage": (u, d) => facility(u, d),
 
-  "system-alert:read": (u, a) => facility(u, a),
-  "system-alert:manage": (u, a) => facility(u, a),
+  "system-alert:read": (u, a) => facility(u, a) || (u.role === "admin" && a.facilityId == null),
+  "system-alert:manage": (u, a) => facility(u, a) || (u.role === "admin" && a.facilityId == null),
 };
 
 // Staff in a patient conversation must still have clinical access to the patient.

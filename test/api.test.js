@@ -6,6 +6,7 @@ import {
   V1,
   api,
   as,
+  auth,
   bearer,
   db,
   googleUser,
@@ -94,6 +95,9 @@ describe("CureCloud API v1", () => {
     const dup = await api().post(`${V1}/auth/signup`).send(payload).expect(409);
     assert.equal(dup.body.code, "conflict");
     await api().post(`${V1}/auth/signup`).send({ ...payload, email: "x@curecloud.test", role: "admin" }).expect(400);
+    // Nobody may pre-register the bootstrap admin's address as pending staff.
+    const squat = await api().post(`${V1}/auth/signup`).send({ ...payload, email: " Admin@CureCloud.test " }).expect(409);
+    assert.equal(squat.body.code, "conflict");
     const badId = await api()
       .post(`${V1}/auth/signup`)
       .send({ ...payload, email: "y@curecloud.test", identifier: { type: "za-id", value: "8001015009088" } })
@@ -144,6 +148,7 @@ describe("CureCloud API v1", () => {
     assert.deepEqual(pending.body.data.map((u) => u.id), [ctx.doctorId]);
     assert.equal(pending.body.nextCursor, null);
     assert.ok("lastSignInAt" in pending.body.data[0]);
+    assert.equal(pending.body.data[0].emailVerified, false);
 
     const alerts = await as(token).get("/system-alerts?status=active").expect(200);
     assert.equal(alerts.body.data.length, 1);
@@ -153,9 +158,13 @@ describe("CureCloud API v1", () => {
     // Activation requires a facility.
     const noFacility = await as(token).patch(`/users/${ctx.doctorId}`, { status: "active" }).expect(400);
     assert.match(noFacility.body.detail, /facilityId/);
-    const approved = await as(token)
-      .patch(`/users/${ctx.doctorId}`, { status: "active", facilityId: "f1", departmentId: "dep-med" })
-      .expect(200);
+    // Approval requires the Firebase Auth email to be verified (§2.1).
+    const approval = { status: "active", facilityId: "f1", departmentId: "dep-med" };
+    const unverified = await as(token).patch(`/users/${ctx.doctorId}`, approval).expect(409);
+    assert.equal(unverified.body.code, "invalid-state-transition");
+    await auth.updateUser(ctx.doctorId, { emailVerified: true });
+    const approved = await as(token).patch(`/users/${ctx.doctorId}`, approval).expect(200);
+    assert.equal(approved.body.emailVerified, true);
     assert.equal(approved.body.status, "active");
 
     const resolved = await as(token).get("/system-alerts?status=active").expect(200);

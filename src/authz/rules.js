@@ -17,7 +17,8 @@ export const ward = (user, patient) =>
   user?.role === "nurse" &&
   present(user.departmentId) &&
   present(patient?.admission?.departmentId) &&
-  patient.admission.departmentId === user.departmentId;
+  patient.admission.departmentId === user.departmentId &&
+  patient.facilityId === user.facilityId; // defence in depth: departments never change facility
 
 export const clinical = (user, patient) => isStaff(user) && Boolean(patient) && (careTeam(user, patient) || ward(user, patient));
 

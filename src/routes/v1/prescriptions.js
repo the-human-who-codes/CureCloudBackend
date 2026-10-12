@@ -42,7 +42,6 @@ import {
 const prescriptions = db.collection("prescriptions");
 const administrations = db.collection("medicationAdministrations");
 const DUE_WINDOW = 30 * MINUTE;
-const LIVE_ADMINISTRATION = ["completed", "not-done"];
 
 const isCurrent = (rx, date = sastDate()) =>
   rx.status === "active" && rx.startDate <= date && (!rx.endDate || date <= rx.endDate);
@@ -55,16 +54,10 @@ function dosesOn(rx, date) {
   return rx.administrationTimes.map((t) => sastInstant(date, t));
 }
 
-// Deterministic ID for a scheduled dose (§1.1): one administration per scheduled dose.
-const doseId = (prescriptionId, scheduledFor) => `${prescriptionId}_${scheduledFor.getTime()}`;
-
-// A retracted scheduled dose may be charted again under an auto ID; find that re-charting.
-const rechartQuery = (prescriptionId, scheduledFor) =>
-  administrations
-    .where("prescriptionId", "==", prescriptionId)
-    .where("scheduledFor", "==", Timestamp.fromDate(scheduledFor))
-    .where("status", "in", LIVE_ADMINISTRATION)
-    .limit(1);
+// A scheduled dose has at most one live administration (§1.1, §2.9): it is locked by
+// administrationSlots/{prescriptionId}_{epochMillis}, released when the administration is retracted.
+const slotRef = (prescriptionId, scheduledFor) =>
+  db.collection("administrationSlots").doc(`${prescriptionId}_${scheduledFor.getTime()}`);
 
 async function loadPrescription(user, id, permission = "prescription:read") {
   const rx = await getDoc("prescriptions", id);
@@ -86,7 +79,7 @@ export function register(router) {
     permission: "prescription:read",
     summary: "List prescriptions, newest first",
     description:
-      "Patients: their own. Doctors and nurses without patientId: prescriberId defaults to and must be me. Excludes entered-in-error unless asked for.",
+      "Patients: their own. Doctors without patientId: prescriberId defaults to and must be me. Nurses must pass a clinical patientId (400 without one). Excludes entered-in-error unless asked for.",
     tags: ["Prescriptions"],
     request: { query: PrescriptionListQuery },
     responses: { 200: PrescriptionPage },
@@ -321,7 +314,8 @@ export function register(router) {
     path: "/medication-administrations",
     permission: "medication-administration:create",
     summary: "Chart a dose as given or not given",
-    description: "Scheduled doses use a deterministic ID, so a dose is charted only once (409 already-charted).",
+    description:
+      "A scheduled dose is locked in administrationSlots in the same transaction, so it has at most one live administration (409 already-charted until it is retracted).",
     tags: ["Prescriptions"],
     request: { body: AdministrationCreateRequest },
     responses: { 201: MedicationAdministration },
@@ -364,24 +358,20 @@ export function register(router) {
         performerName: user.name,
         ...createdFields(user),
       };
-      const ref = await db.runTransaction(async (tx) => {
-        let target = administrations.doc();
-        if (scheduledFor) {
-          const deterministic = administrations.doc(doseId(rx.id, scheduledFor));
-          const existing = await tx.get(deterministic);
-          if (!existing.exists) target = deterministic;
-          else if (existing.get("status") !== "entered-in-error" || !(await tx.get(rechartQuery(rx.id, scheduledFor))).empty) {
-            throw conflict("This dose has already been charted", "already-charted");
-          }
+      const ref = administrations.doc();
+      await db.runTransaction(async (tx) => {
+        const lock = scheduledFor && slotRef(rx.id, scheduledFor);
+        if (lock && (await tx.get(lock)).exists) {
+          throw conflict("This dose has already been charted; retract it first", "already-charted");
         }
-        tx.create(target, doc);
+        if (lock) tx.create(lock, { prescriptionId: rx.id, scheduledFor: doc.scheduledFor, administrationId: ref.id });
+        tx.create(ref, doc);
         writeAudit(tx, user, {
           action: "create",
-          resource: { type: "medication-administration", id: target.id },
+          resource: { type: "medication-administration", id: ref.id },
           patientId: rx.patientId,
           changedFields: Object.keys(body),
         });
-        return target;
       });
       sendCreated(res, `/medication-administrations/${ref.id}`, redact(user, "medication-administration", serialize(await ref.get())));
     },
@@ -392,6 +382,7 @@ export function register(router) {
     path: "/medication-administrations/{id}",
     permission: "medication-administration:retract",
     summary: "Mark an administration entered-in-error (performer only)",
+    description: "Releases the scheduled dose's administrationSlots lock in the same transaction, so the dose can be charted again.",
     tags: ["Prescriptions"],
     request: { params: idParam, body: AdministrationRetractRequest },
     responses: { 200: MedicationAdministration },
@@ -401,17 +392,22 @@ export function register(router) {
       const record = await getDoc("medicationAdministrations", req.valid.params.id);
       const patient = record && (await getDoc("patients", record.patientId));
       authorize(user, "medication-administration:retract", record, { patient });
-      if (record.status === "entered-in-error") throw invalidTransition("Already entered-in-error");
       const ref = administrations.doc(record.id);
-      const batch = db.batch();
-      batch.update(ref, { status: "entered-in-error", statusReason: req.valid.body.statusReason, ...updatedFields(user) });
-      writeAudit(batch, user, {
-        action: "status-change",
-        resource: { type: "medication-administration", id: record.id },
-        patientId: record.patientId,
-        changedFields: ["status", "statusReason"],
+      await db.runTransaction(async (tx) => {
+        const current = (await tx.get(ref)).data();
+        if (current.status === "entered-in-error") throw invalidTransition("Already entered-in-error");
+        // Releasing the lock lets the dose be charted again (§2.9). Only this administration's lock.
+        const lock = current.scheduledFor && slotRef(current.prescriptionId, current.scheduledFor.toDate());
+        const lockSnap = lock && (await tx.get(lock));
+        if (lockSnap?.exists && lockSnap.get("administrationId") === record.id) tx.delete(lock);
+        tx.update(ref, { status: "entered-in-error", statusReason: req.valid.body.statusReason, ...updatedFields(user) });
+        writeAudit(tx, user, {
+          action: "status-change",
+          resource: { type: "medication-administration", id: record.id },
+          patientId: record.patientId,
+          changedFields: ["status", "statusReason"],
+        });
       });
-      await batch.commit();
       res.json(redact(user, "medication-administration", serialize(await ref.get())));
     },
   });
@@ -420,7 +416,9 @@ export function register(router) {
 // --- Schedule computation (§2.9), shared with the nurse dashboard ------------------------------
 
 export async function medicationSchedule(user, { date = sastDate(), departmentId } = {}) {
-  if (departmentId && departmentId !== user.departmentId) throw forbidden("You can only view your own department");
+  if (departmentId && (user.role !== "nurse" || departmentId !== user.departmentId)) {
+    throw forbidden("departmentId is for nurses and must be your own department");
+  }
   let inpatients = (await fetchAll(scoped.patients(user, { admitted: true }), { limit: 300 })).map(raw);
   if (departmentId) inpatients = inpatients.filter((p) => p.admission?.departmentId === departmentId);
   const byPatient = new Map(inpatients.map((p) => [p.id, p]));
@@ -433,41 +431,39 @@ export async function medicationSchedule(user, { date = sastDate(), departmentId
   }
 
   const doses = rxs.flatMap((rx) => dosesOn(rx, date).map((scheduledFor) => ({ rx, scheduledFor })));
-  const refs = doses.map(({ rx, scheduledFor }) => administrations.doc(doseId(rx.id, scheduledFor)));
-  const charted = refs.length ? await db.getAll(...refs) : [];
+  // Locks by deterministic ID, then the administrations they point to (two getAll calls).
+  const locks = doses.length ? await db.getAll(...doses.map(({ rx, scheduledFor }) => slotRef(rx.id, scheduledFor))) : [];
+  const adminIds = locks.filter((l) => l.exists).map((l) => l.get("administrationId"));
+  const charted = adminIds.length ? await db.getAll(...adminIds.map((id) => administrations.doc(id))) : [];
+  const records = new Map(charted.filter((s) => s.exists).map((s) => [s.id, raw(s)]));
   const now = Date.now();
 
-  const data = await Promise.all(
-    doses.map(async ({ rx, scheduledFor }, i) => {
-      let record = charted[i].exists ? raw(charted[i]) : null;
-      if (record?.status === "entered-in-error") {
-        const again = await rechartQuery(rx.id, scheduledFor).get();
-        record = again.empty ? null : raw(again.docs[0]);
-      }
-      const t = scheduledFor.getTime();
-      let status;
-      if (record) status = record.status === "completed" ? "given" : "not-given";
-      else if (now < t - DUE_WINDOW) status = "upcoming";
-      else if (now <= t + DUE_WINDOW) status = "due";
-      else status = "overdue";
-      const patient = byPatient.get(rx.patientId);
-      return {
-        prescriptionId: rx.id,
-        patientId: rx.patientId,
-        patientName: rx.patientName,
-        room: patient?.admission?.room ?? null,
-        bed: patient?.admission?.bed ?? null,
-        allergies: (patient?.allergies ?? []).map((a) => a.substance),
-        medication: rx.medication,
-        dose: rx.dose,
-        route: rx.route,
-        instructions: rx.instructions ?? null,
-        scheduledFor: scheduledFor.toISOString(),
-        status,
-        ...(record && { administrationId: record.id }),
-      };
-    }),
-  );
+  const data = doses.map(({ rx, scheduledFor }, i) => {
+    const lock = locks[i];
+    const record = lock.exists ? records.get(lock.get("administrationId")) : null;
+    const t = scheduledFor.getTime();
+    let status;
+    if (record) status = record.status === "completed" ? "given" : "not-given";
+    else if (now < t - DUE_WINDOW) status = "upcoming";
+    else if (now <= t + DUE_WINDOW) status = "due";
+    else status = "overdue";
+    const patient = byPatient.get(rx.patientId);
+    return {
+      prescriptionId: rx.id,
+      patientId: rx.patientId,
+      patientName: rx.patientName,
+      room: patient?.admission?.room ?? null,
+      bed: patient?.admission?.bed ?? null,
+      allergies: (patient?.allergies ?? []).map((a) => a.substance),
+      medication: rx.medication,
+      dose: rx.dose,
+      route: rx.route,
+      instructions: rx.instructions ?? null,
+      scheduledFor: scheduledFor.toISOString(),
+      status,
+      ...(record && { administrationId: record.id }),
+    };
+  });
   data.sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor) || a.patientName.localeCompare(b.patientName));
   const prn = rxs
     .filter((rx) => rx.frequency === "as-needed" && isCurrent(rx, date))

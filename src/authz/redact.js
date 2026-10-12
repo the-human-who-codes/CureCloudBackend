@@ -27,7 +27,7 @@ const REDACTORS = {
     const admin = userScope(user, doc);
     let out = doc;
     if (!isSelf && !admin) out = omit(out, ["identifier", "emergencyContact", "phone", "email"]);
-    if (user.role !== "admin") out = omit(out, ["lastSignInAt"]);
+    if (!admin) out = omit(out, ["lastSignInAt", "emailVerified"]);
     return out;
   },
 
@@ -89,9 +89,9 @@ const ADMIN_PATIENT_FIELDS = [
 export function writableFields(user, type, resource) {
   if (type !== "patient") return new Set();
   const access = patientAccess(user, resource);
-  if (access === "self") {
-    return new Set([...SELF_PATIENT_FIELDS, ...(resource.identifier ? [] : ["identifier"])]);
-  }
+  // Never identifier for self: a self-asserted ID number is unverified and would squat the
+  // patientIdentifiers reservation.
+  if (access === "self") return new Set(SELF_PATIENT_FIELDS);
   if (access === "clinical") {
     return new Set([...CLINICAL_PATIENT_FIELDS, ...(user.role === "doctor" ? ["status", "deceasedAt"] : [])]);
   }

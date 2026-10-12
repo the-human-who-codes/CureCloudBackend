@@ -79,7 +79,6 @@ export const ROLE_PERMISSIONS = Object.freeze({
     "patient:admit",
     "shift:read",
     "shift:manage",
-    "shift:handover",
     "channel:manage",
     "system-settings:update",
     "system-alert:read",

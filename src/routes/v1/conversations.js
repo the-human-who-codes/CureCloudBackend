@@ -64,18 +64,22 @@ async function planConversation(user, body) {
     if (!hasPermission(user, "channel:manage")) throw forbidden("Only administrators can create channels");
     if (!body.title) throw badRequest("title is required for channels");
     if (body.participantIds?.length) throw badRequest("Channels have implicit membership; omit participantIds");
-    let facilityId = user.facilityId;
+    // Facility admins create channels in their own facility; system admins name the facility.
+    if (body.facilityId && !systemAdmin(user) && body.facilityId !== user.facilityId) {
+      throw forbidden("You can only create channels in your own facility");
+    }
+    const facilityId = systemAdmin(user) ? body.facilityId : user.facilityId;
+    if (!facilityId) throw badRequest("facilityId is required");
+    const facility = await getDoc("facilities", facilityId);
+    if (!facility || facility.status !== "active") throw badRequest("facilityId must be an active facility");
     if (body.departmentId) {
       const dept = await getDoc("departments", body.departmentId);
-      if (!dept || !(systemAdmin(user) || dept.facilityId === user.facilityId)) {
-        throw badRequest("departmentId must be in your facility");
-      }
-      facilityId = dept.facilityId;
+      if (!dept || dept.facilityId !== facilityId) throw badRequest("departmentId must be a department of the channel's facility");
     }
-    if (!facilityId) throw badRequest("System administrators must create channels for a department");
     return { ...base, type: "channel", facilityId, departmentId: body.departmentId ?? null, participantIds: [] };
   }
   if (body.departmentId) throw badRequest("departmentId is only for channels");
+  if (body.facilityId) throw badRequest("facilityId is only for channels");
 
   if (body.type === "patient") {
     if (!body.patientId) throw badRequest("patientId is required for patient conversations");
@@ -97,19 +101,28 @@ async function planConversation(user, body) {
     return { ...base, type: "patient", facilityId, patientId: patient.id, participantIds: ids, people };
   }
 
-  // direct and group: active staff of the same facility.
+  // direct and group: active staff of one facility. A system admin (no facility) may start either
+  // with the staff of any one facility, which then becomes the conversation's facilityId.
   if (user.role === "patient") throw forbidden("Patients can only message their care team");
-  if (!user.facilityId) throw forbidden("You are not assigned to a facility");
   if (body.patientId) throw badRequest("patientId is only for patient conversations");
-  const people = await loadUsers(ids);
-  const valid = people.every((p) => p && STAFF_ROLES.includes(p.role) && p.status === "active" && p.facilityId === user.facilityId);
-  if (!valid) throw forbidden("Participants must be active staff of your facility");
+  if (!user.facilityId && !systemAdmin(user)) throw forbidden("You are not assigned to a facility");
   if (body.type === "direct" && ids.length !== 2) throw badRequest("A direct conversation has exactly two participants");
   if (body.type === "group") {
     if (ids.length < 3) throw badRequest("A group needs at least three participants");
     if (!body.title) throw badRequest("title is required for groups");
   }
-  return { ...base, type: body.type, facilityId: user.facilityId, participantIds: ids, people };
+  const people = await loadUsers(ids);
+  if (!people.every((p) => p && STAFF_ROLES.includes(p.role) && p.status === "active")) {
+    throw forbidden("Participants must be active staff");
+  }
+  const facilityId = user.facilityId ?? people.find((p) => p.facilityId)?.facilityId ?? null;
+  // Every facility member shares the facility; null-facility members are only system admins, and
+  // only a system admin creator may include other system admins (direct between two of them).
+  const sameFacility = people.every((p) => p.facilityId === facilityId || (systemAdmin(user) && systemAdmin(p)));
+  if (!sameFacility || (facilityId === null && body.type === "group")) {
+    throw forbidden("Participants must be active staff of one facility");
+  }
+  return { ...base, type: body.type, facilityId, participantIds: ids, people };
 }
 
 export function register(router) {
@@ -143,7 +156,7 @@ export function register(router) {
     permission: "conversation:create",
     summary: "Start a conversation or create a channel",
     description:
-      "direct: two active staff of one facility (returns the existing one with 200). group: 3–50 staff. channel: admins (channel:manage). patient: exactly the patient's account plus active care team doctors and nurses, otherwise 403.",
+      "direct: two active staff of one facility, or a system admin and any active staff member (returns the existing one with 200). group: 3–50 active staff of one facility. channel: admins (channel:manage) of the facility; system admins pass facilityId; departmentId must be in that facility. patient: exactly the patient's account plus active care team doctors and nurses, otherwise 403.",
     tags: ["Conversations"],
     request: { body: ConversationCreateRequest },
     responses: { 200: Conversation, 201: Conversation },

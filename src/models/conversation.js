@@ -15,7 +15,7 @@ const lastMessageShape = (ts) => ({
 const shape = (ts) => ({
   type: z.enum(CONVERSATION_TYPES),
   title: opt(text(100)),
-  facilityId: z.string(),
+  facilityId: z.string().nullable(), // null only for a direct conversation between two system admins
   departmentId: opt(z.string()),
   patientId: opt(z.string()),
   participantIds: z.array(z.string()).max(50),
@@ -45,6 +45,7 @@ export const ConversationCreateRequest = z
     title: text(100).optional(),
     patientId: id.optional(),
     departmentId: id.optional(),
+    facilityId: id.optional(), // channels created by system admins
   })
   .strict()
   .openapi("ConversationCreateRequest");

@@ -25,7 +25,7 @@ const shape = (ts) => ({
   patientId: opt(id),
   patientName: opt(z.string()),
   facilityId: z.string(),
-  departmentId: z.string(),
+  departmentId: opt(z.string()), // patient tasks: the admission department or null; ward tasks: required
   title: text(200),
   description: opt(text(2000)),
   category: z.enum(TASK_CATEGORIES),
@@ -70,6 +70,15 @@ export const CareTaskCreateRequest = z
     departmentId: id.optional(),
   })
   .strict()
+  // Patient tasks take their department from the admission; ward-level tasks must name one (§2.10).
+  .superRefine((v, ctx) => {
+    if (v.patientId && v.departmentId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["departmentId"], message: "Patient tasks take departmentId from the admission" });
+    }
+    if (!v.patientId && !v.departmentId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["departmentId"], message: "Ward-level tasks need a departmentId" });
+    }
+  })
   .openapi("CareTaskCreateRequest");
 
 export const CareTaskUpdateRequest = z

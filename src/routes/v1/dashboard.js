@@ -232,8 +232,10 @@ export function register(router) {
       if (user.role === "patient") ctx.ownPatientId = (await ownPatient(user))?.id ?? "-";
       const specs = dashboardSpecs(user, now, ctx);
       if (user.role === "nurse") return res.json(await nurseDashboard(user, now, specs));
-      const { pendingUnassigned, ...rest } = await counters(specs);
+      // Facility admins also count pending unassigned staff and system-wide alerts (§4.2).
+      const { pendingUnassigned, systemWideAlerts, ...rest } = await counters(specs);
       if (pendingUnassigned !== undefined) rest.pendingStaff += pendingUnassigned;
+      if (systemWideAlerts !== undefined) rest.activeSystemAlerts += systemWideAlerts;
       res.json({ role: user.role, counters: rest });
     },
   });

@@ -21,10 +21,11 @@ import {
 } from "../../models/index.js";
 import { deepMerge } from "../../lib/settings.js";
 
-const isBootstrapAdmin = ({ email, emailVerified }) => {
+const isBootstrapEmail = (email) => {
   const adminEmail = process.env.BOOTSTRAP_ADMIN_EMAIL?.trim().toLowerCase();
-  return Boolean(adminEmail && emailVerified && email?.toLowerCase() === adminEmail);
+  return Boolean(adminEmail && email?.trim().toLowerCase() === adminEmail);
 };
+const isBootstrapAdmin = ({ email, emailVerified }) => emailVerified && isBootstrapEmail(email);
 
 async function meBody(user) {
   const patient = user.role === "patient" ? await ownPatient(user) : null;
@@ -52,6 +53,8 @@ export function register(router) {
     problems: ["409"],
     async handler(req, res) {
       const body = req.valid.body;
+      // Nobody may pre-register the bootstrap admin's address as a pending staff account.
+      if (isBootstrapEmail(body.email)) throw conflict("This email cannot be used for staff sign-up");
       let record;
       try {
         record = await auth.createUser({ email: body.email, password: body.password, displayName: body.name });

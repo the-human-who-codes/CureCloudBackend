@@ -155,7 +155,7 @@ export function register(router) {
     permission: "appointment:create",
     summary: "Book an appointment",
     description:
-      "Patients book for themselves; staff pass patientId. Checks lead time and booking window (400), opening hours, the doctor's leave and the 15-minute slot locks (409 slot-unavailable). Adds the doctor to the care team.",
+      "Patients book for themselves; staff pass patientId. Checks lead time and booking window (400), opening hours, the doctor's leave and the 15-minute slot locks (409 slot-unavailable). When staff book for a patient with a facility, the doctor must be in it (400; system admins excepted). Adds the doctor to the care team.",
     tags: ["Appointments"],
     request: { body: AppointmentCreateRequest },
     responses: { 201: Appointment },
@@ -171,7 +171,11 @@ export function register(router) {
 
       const doctor = await loadDoctor(body.doctorId);
       if (!doctor.facilityId) throw badRequest("The doctor is not assigned to a facility yet");
-      if (user.role === "admin" && !systemAdmin(user) && doctor.facilityId !== user.facilityId) throw notFound("doctor");
+      // Staff book within the patient's facility; a patient booking for themselves may choose any
+      // active doctor (their own referral choice).
+      if (user.role !== "patient" && !systemAdmin(user) && patient.facilityId && doctor.facilityId !== patient.facilityId) {
+        throw badRequest("The doctor must be in the patient's facility");
+      }
 
       const settings = await getSettings();
       const durationMinutes = body.durationMinutes ?? settings.appointments.defaultDurationMinutes;

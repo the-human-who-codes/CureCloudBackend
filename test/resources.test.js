@@ -36,7 +36,11 @@ describe("v1 resources", () => {
       const dup = await as(u.admin.token).post("/departments", { name: "cardiology", bedCapacity: 1 }).expect(409);
       assert.equal(dup.body.code, "conflict");
       await as(u.admin.token).post("/departments", { name: "Elsewhere", bedCapacity: 1, facilityId: "f2" }).expect(403);
-      await as(u.sys.token).post("/departments", { name: "Trauma", bedCapacity: 8, facilityId: "f2" }).expect(201);
+      ids.trauma = (await as(u.sys.token).post("/departments", { name: "Trauma", bedCapacity: 8, facilityId: "f2" }).expect(201)).body.id;
+      await as(u.sys.token).post("/departments", { name: "Nowhere", bedCapacity: 8 }).expect(400); // system admins name the facility
+      // facilityId is immutable after create.
+      const move = await as(u.admin.token).patch(`/departments/${ids.cardio}`, { facilityId: "f2" }).expect(400);
+      assert.equal(move.body.code, "validation-error");
 
       const list = await as(u.n1.token).get("/departments").expect(200);
       assert.deepEqual(list.body.data.map((d) => d.name), ["Cardiology", "Ward 1"]);
@@ -117,9 +121,30 @@ describe("v1 resources", () => {
       const today = await as(u.n1.token).get(`/care-tasks?completedBy=me&completedAfter=${encodeURIComponent(new Date(Date.now() - 86400e3).toISOString())}`).expect(200);
       assert.deepEqual(today.body.data.map((t) => t.id), [ids.task]);
 
-      const assigned = await as(u.n1.token).post("/care-tasks", { title: "Turn patient", category: "mobility", dueAt: due, assigneeId: u.n2.uid }).expect(201);
+      // Ward-level tasks name their department; nurses only their own.
+      const assigned = await as(u.n1.token)
+        .post("/care-tasks", { title: "Check crash trolley", category: "admin", dueAt: due, departmentId: "ward1", assigneeId: u.n2.uid })
+        .expect(201);
+      assert.equal(assigned.body.patientId, null);
       const notes = await as(u.n2.token).get("/notifications").expect(200);
       assert.ok(notes.body.data.some((n) => n.resource?.id === assigned.body.id));
+      await as(u.n1.token).post("/care-tasks", { title: "Elsewhere", category: "admin", dueAt: due, departmentId: ids.trauma }).expect(403);
+      // Patient tasks take their department from the admission and need a clinical assignee.
+      const both = await as(u.d1.token).post("/care-tasks", { patientId: ids.w, departmentId: "ward1", title: "X", category: "other", dueAt: due }).expect(400);
+      assert.equal(both.body.errors[0].path, "departmentId");
+      await as(u.d1.token).post("/care-tasks", { patientId: ids.w, title: "X", category: "other", dueAt: due, assigneeId: u.admin.uid }).expect(403);
+    });
+
+    test("patient tasks need clinical access to the patient, not just the department", async () => {
+      const due = new Date(Date.now() + 3600e3).toISOString();
+      // An outpatient on Doctor One's care team: the task has no department.
+      const out = await as(u.d1.token).post("/patients", { name: "Lindiwe Outpatient" }).expect(201);
+      const task = await as(u.d1.token).post("/care-tasks", { patientId: out.body.id, title: "Phone with results", category: "other", dueAt: due }).expect(201);
+      assert.equal(task.body.departmentId, null);
+      await as(u.n1.token).get(`/care-tasks/${task.body.id}`).expect(404);
+      await as(u.n1.token).patch(`/care-tasks/${task.body.id}`, { status: "in-progress" }).expect(404);
+      await as(u.d1.token).get(`/care-tasks/${task.body.id}`).expect(200);
+      await as(u.d1.token).post("/care-tasks", { patientId: out.body.id, title: "Y", category: "other", dueAt: due, assigneeId: u.n1.uid }).expect(403);
     });
   });
 
@@ -151,6 +176,16 @@ describe("v1 resources", () => {
       const nurseRoster = await as(u.n1.token).get(`/shifts?departmentId=ward1&from=${encodeURIComponent(iso(now - 86400e3))}`).expect(200);
       assert.equal(nurseRoster.body.data.find((s) => s.id === prev.body.id).handoverNote, "Bed 3A needs 2-hourly obs");
       await as(u.n1.token).get(`/shifts?from=${encodeURIComponent(iso(now))}&to=${encodeURIComponent(iso(now + 40 * 86400e3))}`).expect(400);
+
+      // System admins name a facility or department; handover notes are never written by admins.
+      await as(u.sys.token).get("/shifts").expect(400);
+      assert.equal((await as(u.sys.token).get(`/shifts?facilityId=f1&from=${encodeURIComponent(iso(now - 86400e3))}`).expect(200)).body.data.length, 2);
+      await as(u.admin.token).get("/shifts?facilityId=f1").expect(403);
+      await as(u.admin.token).patch(`/shifts/${prev.body.id}`, { handoverNote: "Admin note" }).expect(403);
+      const own = await as(u.sys.token).post("/shifts", { staffId: u.admin.uid, type: "day", start: iso(now + 72 * 3600e3), end: iso(now + 80 * 3600e3) }).expect(201);
+      await as(u.admin.token).patch(`/shifts/${own.body.id}`, { handoverNote: "My own" }).expect(403);
+      const handoverAudit = await db.collection("auditEvents").where("resource.id", "==", prev.body.id).get();
+      assert.ok(handoverAudit.docs.some((d) => d.get("changedFields").includes("handoverNote")));
 
       await as(u.admin.token).patch(`/shifts/${current.body.id}`, { status: "cancelled" }).expect(200);
       await as(u.admin.token).patch(`/shifts/${current.body.id}`, { type: "night" }).expect(409);
@@ -189,7 +224,8 @@ describe("v1 resources", () => {
       const given = await as(u.n1.token)
         .post("/medication-administrations", { prescriptionId: rx.body.id, scheduledFor: midnight.scheduledFor, status: "completed" })
         .expect(201);
-      assert.equal(given.body.id, `${rx.body.id}_${new Date(midnight.scheduledFor).getTime()}`);
+      const lockRef = db.collection("administrationSlots").doc(`${rx.body.id}_${new Date(midnight.scheduledFor).getTime()}`);
+      assert.equal((await lockRef.get()).get("administrationId"), given.body.id);
       const twice = await as(u.n2.token)
         .post("/medication-administrations", { prescriptionId: rx.body.id, scheduledFor: midnight.scheduledFor, status: "not-done", statusReason: "patient-refused" })
         .expect(409);
@@ -202,12 +238,24 @@ describe("v1 resources", () => {
 
       await as(u.n2.token).patch(`/medication-administrations/${given.body.id}`, { status: "entered-in-error", statusReason: "Wrong" }).expect(403);
       await as(u.n1.token).patch(`/medication-administrations/${given.body.id}`, { status: "entered-in-error", statusReason: "Charted on the wrong patient" }).expect(200);
+      // Retracting releases the lock, so the dose is uncharted again until it is re-charted.
+      assert.equal((await lockRef.get()).exists, false);
+      const retracted = await as(u.n1.token).get(`/medication-schedule?date=${today}`).expect(200);
+      assert.ok(["due", "overdue", "upcoming"].includes(retracted.body.data[0].status));
+      assert.equal(retracted.body.data[0].administrationId, undefined);
+      await as(u.n1.token).patch(`/medication-administrations/${given.body.id}`, { status: "entered-in-error", statusReason: "Again" }).expect(409);
       const recharted = await as(u.n1.token)
         .post("/medication-administrations", { prescriptionId: rx.body.id, scheduledFor: midnight.scheduledFor, status: "completed" })
         .expect(201);
       assert.notEqual(recharted.body.id, given.body.id);
       const final = await as(u.n1.token).get(`/medication-schedule?date=${today}`).expect(200);
       assert.equal(final.body.data[0].administrationId, recharted.body.id);
+      assert.equal(final.body.data[0].status, "given");
+      await as(u.n1.token).get(`/medication-schedule?departmentId=ward1`).expect(200);
+      await as(u.d1.token).get(`/medication-schedule?departmentId=ward1`).expect(403); // nurses only
+      // Nurses list prescriptions per clinical patient only.
+      await as(u.n1.token).get("/prescriptions").expect(400);
+      await as(u.n1.token).get(`/prescriptions?patientId=${ids.w}`).expect(200);
 
       const history = await as(u.n1.token).get("/medication-administrations?performerId=me").expect(200);
       assert.deepEqual(history.body.data.map((a) => a.id), [recharted.body.id]);
@@ -297,8 +345,12 @@ describe("v1 resources", () => {
       const alert = db.collection("systemAlerts").doc("a1");
       await alert.set({ title: "Disk", message: "Low", severity: "warning", status: "active", source: "system", facilityId: "f1", resource: null, resolvedAt: null, resolvedBy: null, ...audit("system") });
       await db.collection("systemAlerts").doc("a2").set({ title: "Other", message: "x", severity: "critical", status: "active", source: "system", facilityId: "f2", resource: null, resolvedAt: null, resolvedBy: null, ...audit("system") });
+      await db.collection("systemAlerts").doc("a3").set({ title: "Wide", message: "All", severity: "info", status: "active", source: "system", facilityId: null, resource: null, resolvedAt: null, resolvedBy: null, ...audit("system") });
+      // Facility admins see their facility's alerts plus system-wide ones (no PHI).
       const mine = await as(u.admin.token).get("/system-alerts?status=active").expect(200);
-      assert.deepEqual(mine.body.data.map((a) => a.id), ["a1"]);
+      assert.deepEqual(mine.body.data.map((a) => a.id).sort(), ["a1", "a3"]);
+      const dashboard = await as(u.admin.token).get("/dashboard").expect(200);
+      assert.equal(dashboard.body.counters.activeSystemAlerts, 2);
       assert.equal((await as(u.sys.token).get("/system-alerts?severity=critical").expect(200)).body.data.length, 1);
       await as(u.admin.token).patch("/system-alerts/a2", { status: "resolved" }).expect(404);
       const resolved = await as(u.admin.token).patch("/system-alerts/a1", { status: "resolved" }).expect(200);
@@ -331,7 +383,7 @@ describe("v1 resources", () => {
       }
       const doctor = await as(u.d1.token).get("/reports/summary").expect(200);
       assert.deepEqual(doctor.body.scope, { type: "practitioner", id: u.d1.uid });
-      assert.equal(doctor.body.patients.total, 7);
+      assert.equal(doctor.body.patients.total, 8);
       assert.equal(doctor.body.patients.byAcuity.critical, 1);
       assert.deepEqual(doctor.body.patients.topConditions, [{ category: "E11", name: "Type 2 diabetes", count: 5 }]);
       assert.equal(doctor.body.patients.byAgeGroup["65+"], 5);
@@ -341,7 +393,7 @@ describe("v1 resources", () => {
       const admin = await as(u.admin.token).get("/reports/summary").expect(200);
       assert.deepEqual(admin.body.scope, { type: "facility", id: "f1" });
       assert.equal(admin.body.patients.byAcuity.critical, null); // 1 is a small cell
-      assert.equal(admin.body.patients.byAcuity.stable, 5); // Pat has no facility yet
+      assert.equal(admin.body.patients.byAcuity.stable, 6); // bulk + the outpatient; Pat has no facility yet
       assert.equal(admin.body.patients.topConditions.length, 1);
       assert.ok(admin.body.prescriptions.topMedications.every((m) => m.count >= 5));
       const ward = admin.body.departments.find((d) => d.departmentId === "ward1");
@@ -365,6 +417,11 @@ describe("v1 resources", () => {
       assert.equal(history.docs[0].get("dischargedBy"), u.d1.uid);
       await as(u.d1.token).post(`/patients/${ids.w}/admission/discharge`, {}).expect(409);
       assert.equal((await as(u.n1.token).get("/patients").expect(200)).body.data.length, 0); // no longer on the ward
+      // The ward nurse loses the patient's tasks with the patient.
+      await as(u.n1.token).get(`/care-tasks/${ids.task}`).expect(404);
+      const tasks = await as(u.n1.token).get("/care-tasks?status=open,in-progress,completed").expect(200);
+      assert.ok(!tasks.body.data.some((t) => t.patientId === ids.w));
+      await as(u.d1.token).get(`/care-tasks/${ids.task}`).expect(200); // still on the care team
     });
   });
 });

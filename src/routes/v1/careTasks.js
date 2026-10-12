@@ -1,13 +1,13 @@
 // Care tasks (docs/domain-model.md §2.10, §4.2 "Care tasks and shifts").
 import { Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebase.js";
-import { authorize, clinical, getDoc, loadPatient, redact, scoped } from "../../authz/index.js";
+import { authorize, can, clinical, getDoc, loadPatient, patientsById, redact, scoped } from "../../authz/index.js";
 import { writeAudit } from "../../lib/audit.js";
 import { paginate } from "../../lib/firestore-query.js";
 import { notify } from "../../lib/notify.js";
 import { badRequest, conflict, forbidden, invalidTransition, notFound } from "../../lib/problem.js";
 import { defineRoute } from "../../lib/route.js";
-import { serialize, toJson } from "../../lib/serialize.js";
+import { raw, serialize, toJson } from "../../lib/serialize.js";
 import { createdFields, orNull, sendCreated, updatedFields } from "../../lib/write.js";
 import {
   CareTask,
@@ -21,13 +21,26 @@ import {
 
 const tasks = db.collection("careTasks");
 
-// Assignees are active nurses in the task's department.
-async function loadAssignee(assigneeId, departmentId) {
-  const nurse = await getDoc("users", assigneeId);
-  if (nurse?.role !== "nurse" || nurse.status !== "active" || nurse.departmentId !== departmentId) {
-    throw badRequest("assigneeId must be an active nurse in the task's department");
+// Patient tasks: the assignee must be a doctor or nurse with clinical access to the patient (403).
+// Ward-level tasks: active staff of the task's department (400).
+async function loadAssignee(assigneeId, { patient, departmentId }) {
+  const staff = await getDoc("users", assigneeId);
+  const active = ["doctor", "nurse"].includes(staff?.role) && staff.status === "active";
+  if (patient) {
+    if (!active || !clinical(staff, patient)) throw forbidden("The assignee needs clinical access to the patient");
+  } else if (!active || staff.departmentId !== departmentId) {
+    throw badRequest("assigneeId must be active staff of the task's department");
   }
-  return nurse;
+  return staff;
+}
+
+// Ward-level tasks: an active department of the caller's facility; nurses only their own (§2.10).
+async function loadWardDepartment(user, departmentId) {
+  const dept = await getDoc("departments", departmentId);
+  if (!dept || dept.status !== "active") throw badRequest("departmentId must be an active department");
+  if (dept.facilityId !== user.facilityId) throw forbidden("The department is in another facility");
+  if (user.role === "nurse" && dept.id !== user.departmentId) throw forbidden("Nurses create ward tasks in their own department");
+  return dept;
 }
 
 async function loadTask(user, id, permission = "care-task:read") {
@@ -76,7 +89,11 @@ export function register(router) {
         ctx,
       );
       const page = await paginate(s, { limit, cursor });
-      res.json({ data: page.docs.map((d) => redact(user, "care-task", serialize(d))), nextCursor: page.nextCursor });
+      // Patient tasks stay visible only while the caller has clinical access to the patient, so the
+      // page is filtered in memory (it may hold fewer than limit items; nextCursor follows the query).
+      const byId = await patientsById(page.docs.map((d) => d.get("patientId")));
+      const visible = page.docs.filter((d) => can(user, "care-task:read", raw(d), { patient: byId.get(d.get("patientId")) }));
+      res.json({ data: visible.map((d) => redact(user, "care-task", serialize(d))), nextCursor: page.nextCursor });
     },
   });
 
@@ -86,7 +103,7 @@ export function register(router) {
     permission: "care-task:create",
     summary: "Create a care task",
     description:
-      "Patient tasks need clinical access. departmentId defaults to the patient's admission department, otherwise the creator's department. Assigning notifies the assignee.",
+      "Patient tasks need clinical access; departmentId is not accepted (it is the patient's admission department, or null) and the assignee must have clinical access (403). Ward-level tasks need departmentId: an active department of the caller's facility (nurses: their own); the assignee must be active staff of it. Assigning notifies the assignee.",
     tags: ["Care tasks"],
     request: { body: CareTaskCreateRequest },
     responses: { 201: CareTask },
@@ -96,19 +113,17 @@ export function register(router) {
       const body = req.valid.body;
       const patient = body.patientId ? await loadPatient(user, body.patientId) : null;
       authorize(user, "care-task:create", {}, { patient });
-      const departmentId = body.departmentId ?? patient?.admission?.departmentId ?? user.departmentId;
-      if (!departmentId) throw badRequest("departmentId is required");
-      const dept = await getDoc("departments", departmentId);
-      if (!dept || dept.status !== "active") throw badRequest("departmentId must be an active department");
-      if (user.facilityId && dept.facilityId !== user.facilityId) throw badRequest("The department is in another facility");
-      const assignee = body.assigneeId ? await loadAssignee(body.assigneeId, departmentId) : null;
+      const dept = patient ? null : await loadWardDepartment(user, body.departmentId);
+      const departmentId = patient ? (patient.admission?.departmentId ?? null) : dept.id;
+      const facilityId = patient ? (patient.facilityId ?? user.facilityId) : dept.facilityId;
+      const assignee = body.assigneeId ? await loadAssignee(body.assigneeId, { patient, departmentId }) : null;
 
       const ref = tasks.doc();
       const batch = db.batch();
       batch.create(ref, {
         patientId: patient?.id ?? null,
         patientName: patient?.name ?? null,
-        facilityId: dept.facilityId,
+        facilityId,
         departmentId,
         title: body.title,
         description: orNull(body.description),
@@ -172,7 +187,7 @@ export function register(router) {
     async handler(req, res) {
       const user = req.user;
       const body = req.valid.body;
-      const { task } = await loadTask(req.user, req.valid.params.id, "care-task:update");
+      const { task, patient } = await loadTask(req.user, req.valid.params.id, "care-task:update");
       if (!TASK_TRANSITIONS[task.status]) throw conflict(`A ${task.status} task cannot be changed`, "record-immutable");
 
       const update = { ...updatedFields(user) };
@@ -185,7 +200,7 @@ export function register(router) {
       if (body.assigneeId !== undefined && body.assigneeId !== task.assigneeId) {
         if (body.assigneeId === null) Object.assign(update, { assigneeId: null, assigneeName: null });
         else {
-          assignee = await loadAssignee(body.assigneeId, task.departmentId);
+          assignee = await loadAssignee(body.assigneeId, { patient, departmentId: task.departmentId });
           Object.assign(update, { assigneeId: assignee.id, assigneeName: assignee.name });
         }
       }

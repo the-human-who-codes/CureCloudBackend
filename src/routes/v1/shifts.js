@@ -54,7 +54,7 @@ export function register(router) {
     permission: "shift:read",
     summary: "The roster for a window, sorted by start",
     description:
-      "Scoped to the caller's facility. staffId accepts me. Window at most 31 days (default: today plus 7 days). handoverNote is visible only to the owner and to doctors and nurses of the same department.",
+      "Scoped to the caller's facility. staffId accepts me. System admins must pass facilityId, departmentId or staffId (400 otherwise); facilityId is for system admins only. Window at most 31 days (default: today plus 7 days). handoverNote is visible only to the owner and to doctors and nurses of the same department.",
     tags: ["Shifts"],
     request: { query: ShiftListQuery },
     responses: { 200: ShiftPage },
@@ -100,7 +100,8 @@ export function register(router) {
     path: "/shifts",
     permission: "shift:manage",
     summary: "Add a shift or leave to the roster",
-    description: "The staff member must be active and in the admin's facility. 409 conflict on overlap.",
+    description:
+      "The staff member must be active and pass facility for the caller (system admins: any facility). The shift's facilityId is the staff member's facility and departmentId must be one of its departments. 409 conflict on overlap.",
     tags: ["Shifts"],
     request: { body: ShiftCreateRequest },
     responses: { 201: Shift },
@@ -146,6 +147,7 @@ export function register(router) {
     path: "/shifts/{id}",
     permission: ["shift:manage", "shift:handover"],
     summary: "Edit or cancel a shift (admins) or write the handover note (shift owner)",
+    description: "Only the owner of a doctor or nurse shift writes handoverNote; admins never do (403).",
     tags: ["Shifts"],
     request: { params: idParam, body: ShiftUpdateRequest },
     responses: { 200: Shift },

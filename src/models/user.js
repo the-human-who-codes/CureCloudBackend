@@ -87,7 +87,7 @@ export const UserStored = z.object({ ...shape(storedTimestamp), ...storedMeta, n
 
 // PII fields are optional in the response because redaction removes them (§3.4).
 export const User = z
-  .object({ id, ...shape(isoTimestamp), lastSignInAt: opt(isoTimestamp) })
+  .object({ id, ...shape(isoTimestamp), lastSignInAt: opt(isoTimestamp), emailVerified: z.boolean().optional() })
   .partial({ email: true, phone: true, identifier: true, emergencyContact: true })
   .openapi("User");
 export const UserPage = page(User, "UserPage");

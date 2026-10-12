@@ -1,7 +1,7 @@
 // Account management and the practitioner directory (docs/domain-model.md §2.1, §2.2,
 // §4.2 "Users, directory, organisation").
 import { auth, db } from "../../firebase.js";
-import { authorize, getDoc, queries, redact, scoped, systemAdmin } from "../../authz/index.js";
+import { authorize, getDoc, queries, redact, scoped, systemAdmin, userScope } from "../../authz/index.js";
 import { writeAudit } from "../../lib/audit.js";
 import { fetchInTx, paginate } from "../../lib/firestore-query.js";
 import { notify } from "../../lib/notify.js";
@@ -27,22 +27,27 @@ const CONTROL_FIELDS = ["role", "status", "facilityId", "departmentId"];
 const STATUS_TRANSITIONS = { pending: ["active", "disabled"], active: ["disabled"], disabled: ["active"] };
 const isStaffRole = (role) => STAFF_ROLES.includes(role);
 
-// lastSignInAt is not stored; it comes from Firebase Auth metadata on admin reads.
-async function lastSignIns(ids) {
+// lastSignInAt and emailVerified are not stored; they come from the Firebase Auth record on admin reads.
+async function authRecords(ids) {
   const out = new Map();
   for (let i = 0; i < ids.length; i += 100) {
     const result = await auth.getUsers(ids.slice(i, i + 100).map((uid) => ({ uid })));
     for (const record of result.users) {
       const at = record.metadata.lastSignInTime;
-      out.set(record.uid, at ? new Date(at).toISOString() : null);
+      out.set(record.uid, { lastSignInAt: at ? new Date(at).toISOString() : null, emailVerified: record.emailVerified });
     }
   }
   return out;
 }
 
 async function userResponses(caller, docs) {
-  const signIns = caller.role === "admin" ? await lastSignIns(docs.map((d) => d.id)) : new Map();
-  return docs.map((u) => redact(caller, "user", { ...toJson(u), lastSignInAt: signIns.get(u.id) ?? null }));
+  const inScope = docs.filter((u) => userScope(caller, u));
+  const records = inScope.length ? await authRecords(inScope.map((d) => d.id)) : new Map();
+  return docs.map((u) => {
+    const record = records.get(u.id);
+    const extra = record ?? (userScope(caller, u) ? { lastSignInAt: null, emailVerified: false } : {});
+    return redact(caller, "user", { ...toJson(u), ...extra });
+  });
 }
 
 export function register(router) {
@@ -91,7 +96,7 @@ export function register(router) {
     permission: "user:update",
     summary: "Approve, disable, re-role or reassign an account",
     description:
-      "Enforces the invariants in §2.1: no self-change of role/status/facilityId/departmentId; only system admins touch admin accounts, patient accounts, role: admin or an admin's facilityId; facility admins manage doctors and nurses of their facility or pending unassigned ones and may only set facilityId to their own; the last active system admin keeps its role, status and null facilityId (409). Activating staff requires facilityId, departmentId for nurses and practitioner.licenceNumber.",
+      "Enforces the invariants in §2.1: no self-change of role/status/facilityId/departmentId; only system admins touch admin accounts, patient accounts, role: admin or an admin's facilityId; facility admins manage doctors and nurses of their facility or pending unassigned ones and may only set facilityId to their own; the last active system admin keeps its role, status and null facilityId (409). Activating staff requires facilityId, departmentId for nurses, practitioner.licenceNumber and a verified Firebase Auth email (409 otherwise). departmentId must be an active department of the resulting facilityId, and any facilityId change must also set or clear departmentId (400).",
     tags: ["Users"],
     request: { params: idParam, body: UserUpdateRequest },
     responses: { 200: User },
@@ -100,6 +105,8 @@ export function register(router) {
       const user = req.user;
       const body = req.valid.body;
       const ref = users.doc(req.valid.params.id);
+      // Approval needs a verified sign-in email (§2.1). Auth is not transactional, so read it first.
+      const authRecord = body.status === "active" ? await auth.getUser(ref.id).catch(() => null) : null;
       const before = await db.runTransaction(async (tx) => {
         const target = raw(await tx.get(ref));
         authorize(user, "user:update", target, {}, { what: "user" });
@@ -107,7 +114,7 @@ export function register(router) {
         const role = body.role ?? target.role;
         const status = body.status ?? target.status;
         const facilityId = body.facilityId !== undefined ? body.facilityId : (target.facilityId ?? null);
-        let departmentId = body.departmentId !== undefined ? body.departmentId : (target.departmentId ?? null);
+        const departmentId = body.departmentId !== undefined ? body.departmentId : (target.departmentId ?? null);
 
         // Reads first (transactions require all reads before writes).
         const wasActiveSystemAdmin = target.role === "admin" && target.status === "active" && !target.facilityId;
@@ -129,14 +136,18 @@ export function register(router) {
           throw forbidden("You can only assign staff to your own facility");
         }
         if (body.facilityId && (!facility || facility.status !== "active")) throw badRequest("facilityId must be an active facility");
-        const departmentTouched = body.departmentId !== undefined || facilityId !== (target.facilityId ?? null);
-        if (departmentTouched && departmentId) {
-          if (body.departmentId === undefined && department?.facilityId !== facilityId) {
-            departmentId = null; // moving facility drops a department of the old facility
-          } else if (!department || department.facilityId !== facilityId || department.status !== "active") {
+        // Department and facility stay consistent (§2.1): a facility change must set or clear the
+        // department in the same request, and a department always belongs to the resulting facility.
+        const facilityChanged = facilityId !== (target.facilityId ?? null);
+        if (facilityChanged && body.departmentId === undefined) {
+          throw badRequest("Changing facilityId requires setting or clearing departmentId in the same request");
+        }
+        if (departmentId && (!department || department.facilityId !== facilityId || department.status !== "active")) {
+          if (body.departmentId !== undefined || facilityChanged) {
             throw badRequest("departmentId must be an active department of the user's facility");
           }
         }
+        if (!facilityId && departmentId) throw badRequest("A user without a facility cannot have a department");
 
         let practitioner = target.practitioner ?? null;
         const update = { ...updatedFields(user) };
@@ -166,6 +177,9 @@ export function register(router) {
           if (!facilityId) throw badRequest("facilityId is required to activate staff");
           if (role === "nurse" && !departmentId) throw badRequest("departmentId is required to activate a nurse");
           if (!practitioner?.licenceNumber) throw badRequest("practitioner.licenceNumber is required to activate staff");
+        }
+        if (target.status === "pending" && status === "active" && authRecord?.emailVerified !== true) {
+          throw invalidTransition("The account's email address is not verified yet");
         }
 
         Object.assign(update, { role, status, facilityId, departmentId, practitioner });

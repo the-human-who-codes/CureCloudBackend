@@ -58,7 +58,7 @@ export function register(router) {
     path: "/system-alerts",
     permission: "system-alert:read",
     summary: "Operational alerts for the admin's facility, newest first",
-    description: "System admins see every alert, including system-wide ones (facilityId null).",
+    description: "Facility admins see their facility's alerts plus system-wide ones (facilityId null); system admins see every alert.",
     tags: ["System"],
     request: { query: SystemAlertListQuery },
     responses: { 200: SystemAlertPage },
