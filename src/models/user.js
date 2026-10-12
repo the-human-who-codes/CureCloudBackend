@@ -9,6 +9,7 @@ import {
   email,
   id,
   instant,
+  isoDate,
   isoTimestamp,
   listQuery,
   namePart,
@@ -135,7 +136,7 @@ export const MeCreateRequest = z
   .object({
     name: personName.optional(),
     phone: phone.optional(),
-    birthDate: z.string().optional(), // validated as isoDate by the patient model
+    birthDate: isoDate.optional(),
     sex: z.enum(["female", "male", "intersex", "unknown"]).optional(),
   })
   .strict();

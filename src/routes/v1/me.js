@@ -17,7 +17,6 @@ import {
   SignupRequest,
   SignupResponse,
   UserPreferences,
-  isoDate,
 } from "../../models/index.js";
 import { deepMerge } from "../../lib/settings.js";
 
@@ -141,11 +140,6 @@ export function register(router) {
     async handler(req, res) {
       if (req.user) throw conflict("Profile already exists");
       const body = req.valid.body;
-      if (body.birthDate !== undefined && !isoDate.safeParse(body.birthDate).success) {
-        throw problem("validation-error", "1 field is invalid", {
-          errors: [{ path: "birthDate", message: "Expected YYYY-MM-DD", code: "invalid_string" }],
-        });
-      }
       const name = body.name ?? req.auth.name;
       if (!name || name.trim().length < 2) {
         throw problem("validation-error", "1 field is invalid", {

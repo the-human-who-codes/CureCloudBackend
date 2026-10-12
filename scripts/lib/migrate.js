@@ -1,6 +1,6 @@
 // The v1 → v2 data migration (docs/domain-model.md §6), separate from the CLI so tests can run it
 // against the emulator. Idempotent: documents with schemaVersion >= 2 are skipped, missing slot locks
-// are only created when absent, and facilities/default only when no facility exists.
+// are only created when absent, and the fallback facility only when no facility exists.
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import {
   DELETE,
@@ -58,14 +58,32 @@ const merged = (doc, update) => {
   return out;
 };
 
+// The facility migrated documents fall back to: the requested ID (which must exist once any facility
+// does), facilities/default when there is none yet, or the only existing one. Several facilities and
+// no --default-facility-id abort the run before anything is written.
+export function resolveDefaultFacility(existingIds, requested) {
+  if (!existingIds.length) return requested ?? DEFAULT_FACILITY_ID;
+  if (requested) {
+    if (!existingIds.includes(requested)) throw new Error(`Facility ${requested} does not exist`);
+    return requested;
+  }
+  if (existingIds.length === 1) return existingIds[0];
+  throw new Error(
+    `${existingIds.length} facilities exist; pass --default-facility-id <id> to choose the fallback facility`,
+  );
+}
+
 const docsOf = (snap) => snap.docs.map((d) => ({ ref: d.ref, doc: { id: d.id, ...d.data() } }));
 
 /**
  * @param {import("firebase-admin/firestore").Firestore} db
- * @param {{ apply?: boolean, defaultFacilityName?: string, now?: Timestamp }} options
- * @returns {Promise<{ apply: boolean, collections: Record<string, { scanned: number, migrated: number, samples: { id: string, fields: string[] }[] }> }>}
+ * @param {{ apply?: boolean, defaultFacilityId?: string, defaultFacilityName?: string, now?: Timestamp }} options
+ * @returns {Promise<{ apply: boolean, defaultFacilityId: string, collections: Record<string, { scanned: number, migrated: number, samples: { id: string, fields: string[] }[] }> }>}
  */
-export async function runMigration(db, { apply = false, defaultFacilityName = "CureCloud Demo Hospital", now = Timestamp.now() } = {}) {
+export async function runMigration(
+  db,
+  { apply = false, defaultFacilityId: requestedFacilityId, defaultFacilityName = "CureCloud Demo Hospital", now = Timestamp.now() } = {},
+) {
   const writer = new Writer(db, apply);
   const report = { apply, collections: {} };
   const stats = (name) => (report.collections[name] ??= { scanned: 0, migrated: 0, samples: [] });
@@ -96,15 +114,18 @@ export async function runMigration(db, { apply = false, defaultFacilityName = "C
     });
   }
 
-  // 1. facilities/default when no facility exists yet.
-  const anyFacility = await db.collection("facilities").limit(1).get();
+  // 1. The fallback facility for staff, patients with a care team and appointments without one:
+  // created when no facility exists yet, otherwise an existing one (see resolveDefaultFacility).
+  const existing = await db.collection("facilities").select().get();
   const facilities = stats("facilities");
-  facilities.scanned = anyFacility.size;
-  if (anyFacility.empty) {
+  facilities.scanned = existing.size;
+  const defaultFacilityId = resolveDefaultFacility(existing.docs.map((d) => d.id), requestedFacilityId);
+  report.defaultFacilityId = defaultFacilityId;
+  if (existing.empty) {
     facilities.migrated++;
-    facilities.samples.push({ id: DEFAULT_FACILITY_ID, fields: ["name", "type", "status"] });
+    facilities.samples.push({ id: defaultFacilityId, fields: ["name", "type", "status"] });
     await writer.add(2, (batch) => {
-      batch.create(db.collection("facilities").doc(DEFAULT_FACILITY_ID), {
+      batch.create(db.collection("facilities").doc(defaultFacilityId), {
         name: defaultFacilityName,
         type: "hospital",
         address: null,
@@ -117,7 +138,7 @@ export async function runMigration(db, { apply = false, defaultFacilityName = "C
         updatedBy: "system",
         schemaVersion: 2,
       });
-      audit(batch, { type: "facility", id: DEFAULT_FACILITY_ID }, ["name", "type", "status"]);
+      audit(batch, { type: "facility", id: defaultFacilityId }, ["name", "type", "status"]);
     });
   }
 
@@ -127,7 +148,7 @@ export async function runMigration(db, { apply = false, defaultFacilityName = "C
   const users = docsOf(await db.collection("users").get());
   const ctx = {
     now,
-    defaultFacilityId: DEFAULT_FACILITY_ID,
+    defaultFacilityId,
     users: new Map(users.map(({ doc }) => [doc.id, doc])),
     patients: new Map(),
   };
@@ -193,6 +214,7 @@ export async function runMigration(db, { apply = false, defaultFacilityName = "C
 // Human-readable report: counts per collection and sample diffs with IDs and field names only (no PHI).
 export function formatReport(report) {
   const lines = [report.apply ? "Applied migration:" : "Dry run (pass --apply to write):"];
+  lines.push(`  fallback facility: ${report.defaultFacilityId}`);
   for (const [name, s] of Object.entries(report.collections)) {
     lines.push(`  ${name}: ${s.migrated} to migrate of ${s.scanned} scanned`);
     for (const sample of s.samples) lines.push(`    - ${sample.id}: ${sample.fields.join(", ") || "(schema stamp only)"}`);

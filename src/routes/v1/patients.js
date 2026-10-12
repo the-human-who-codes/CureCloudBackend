@@ -246,6 +246,7 @@ export function register(router) {
       if (status === "deceased" && !(body.deceasedAt ?? patient.deceasedAt)) {
         throw badRequest("deceasedAt is required when status is deceased");
       }
+      if (body.deceasedAt && status !== "deceased") throw badRequest("deceasedAt can only be set when status is deceased");
       if (body.status && body.status !== "deceased") update.deceasedAt = null;
       if (body.name) update.nameLower = nameLower(body.name);
       if (body.chronicConditions) update.conditionCategories = conditionCategories(body.chronicConditions);
@@ -443,19 +444,27 @@ export function register(router) {
       }
       const update = {};
       for (const key of ["ward", "room", "bed", "attendingDoctorId"]) {
-        if (body[key] !== undefined) update[`admission.${key}`] = body[key];
+        if (body[key] !== undefined) update[key] = body[key];
       }
       if (body.departmentId && body.departmentId !== patient.admission.departmentId) {
         const dept = await loadDepartment(body.departmentId);
         if (dept.facilityId !== patient.facilityId) throw badRequest("The department is in another facility");
-        update["admission.departmentId"] = dept.id;
-        update["admission.departmentName"] = dept.name;
+        update.departmentId = dept.id;
+        update.departmentName = dept.name;
       }
       await checkAttendingDoctor(body.attendingDoctorId);
-      const batch = db.batch();
-      batch.update(patients.doc(patientId), { ...update, ...updatedFields(user) });
-      writeAudit(batch, user, { action: "update", resource: { type: "admission", id: patientId }, patientId, changedFields: Object.keys(body) });
-      await batch.commit();
+      // Re-checked in the transaction so a concurrent discharge or transfer cannot be overwritten
+      // with a partial admission (§8). The whole admission map is written, never dotted paths.
+      const ref = patients.doc(patientId);
+      await db.runTransaction(async (tx) => {
+        const current = { id: patientId, ...(await tx.get(ref)).data() };
+        if (!current.admission) throw invalidTransition("The patient is not admitted");
+        if (user.role === "nurse" && !ward(user, current)) {
+          throw forbidden("Nurses can only move patients within their own department");
+        }
+        tx.update(ref, { admission: { ...current.admission, ...update }, ...updatedFields(user) });
+        writeAudit(tx, user, { action: "update", resource: { type: "admission", id: patientId }, patientId, changedFields: Object.keys(body) });
+      });
       res.json(patientResponse(user, await reload(patientId)));
     },
   });

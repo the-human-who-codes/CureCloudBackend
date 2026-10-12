@@ -68,14 +68,17 @@ export const scoped = {
       if (departmentId) throw forbidden("doctors list their own schedule");
       where.push(["doctorId", "==", actor(user, doctorId ?? "me")]);
     } else if (user.role === "nurse") {
-      if (doctorId !== undefined) actor(user, doctorId);
+      if (doctorId !== undefined) throw badRequest("doctorId needs patientId for nurses");
       if (departmentId && departmentId !== user.departmentId) throw forbidden("You can only list your own department");
       if (!user.departmentId) throw forbidden("patientId is required");
       where.push(["departmentId", "==", user.departmentId]);
     } else if (user.role === "admin") {
+      if (doctorId && departmentId) throw badRequest("doctorId cannot be combined with departmentId");
       if (doctorId) {
         if (ctx.doctorId !== doctorId) throw forbidden();
         where.push(["doctorId", "==", doctorId]);
+        // facilityId is copied at booking time: a doctor who moved keeps their old facility's bookings.
+        if (!systemAdmin(user)) where.push(["facilityId", "==", user.facilityId]);
       } else if (departmentId) {
         if (ctx.departmentId !== departmentId) throw forbidden();
         where.push(["departmentId", "==", departmentId]);
@@ -186,6 +189,8 @@ export const scoped = {
       const s = staffId === "me" ? user.id : staffId;
       if (s !== user.id && ctx.staffId !== s) throw forbidden();
       where.push(["staffId", "==", s]);
+      // A colleague's shifts from a previous facility keep that facilityId and stay out of scope.
+      if (s !== user.id && !systemAdmin(user)) where.push(["facilityId", "==", user.facilityId]);
     } else if (departmentId) {
       if (ctx.departmentId !== departmentId) throw forbidden();
       where.push(["departmentId", "==", departmentId]);
@@ -334,7 +339,8 @@ export const scoped = {
   },
 };
 
-// Role-specific dashboard counters (§4.2). Every value is a count() over one of these specs.
+// Role-specific dashboard counters (§4.2). Every value is a count() over one of these specs, except
+// the nurse dueTasks list.
 // ctx.ownPatientId: the caller's own patient record (patients only).
 export function dashboardSpecs(user, now, { ownPatientId, startOfDay, endOfDay } = {}) {
   const upcoming = ["pending", "confirmed"];
@@ -366,9 +372,10 @@ export function dashboardSpecs(user, now, { ownPatientId, startOfDay, endOfDay }
     return {
       patientsUnderCare: noOrder(scoped.patients(user, {})),
       criticalPatients: noOrder(scoped.patients(user, { acuity: "critical" })),
-      tasksDueToday: count("careTasks", [taskScope, eq("status", OPEN_TASK), ["dueAt", "<", endOfDay]]),
-      overdueTasks: spec("careTasks", {
-        where: [taskScope, eq("status", OPEN_TASK), ["dueAt", "<", now]],
+      // Fetched, not counted: patient tasks are filtered by care-task:read in memory (§2.10), and the
+      // overdue-task alerts are the rows due before now.
+      dueTasks: spec("careTasks", {
+        where: [taskScope, eq("status", OPEN_TASK), ["dueAt", "<", endOfDay]],
         orderBy: [["dueAt", "asc", ts]],
       }),
     };

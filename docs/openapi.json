@@ -6441,7 +6441,10 @@
                     "example": "+27821234567"
                   },
                   "birthDate": {
-                    "type": "string"
+                    "type": "string",
+                    "format": "date",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                    "example": "1990-05-04"
                   },
                   "sex": {
                     "type": "string",
@@ -6626,7 +6629,7 @@
     "/api/v1/dashboard": {
       "get": {
         "summary": "Role-specific dashboard counters (discriminated by role)",
-        "description": "Counts are count() aggregations; the nurse medication counters come from today's medication schedule.\n\nRequires permission `dashboard:read`.",
+        "description": "Counts are count() aggregations; the nurse medication counters come from today's medication schedule, and tasksDueToday and the overdue-task alerts only include tasks the nurse may read (patient tasks need current clinical access; at most 500 tasks are considered).\n\nRequires permission `dashboard:read`.",
         "tags": [
           "Dashboard"
         ],
@@ -8329,7 +8332,7 @@
     "/api/v1/appointments": {
       "get": {
         "summary": "List appointments, sorted by start",
-        "description": "Default scope: patient (own), doctor (own schedule), nurse (own department, or a clinical patientId), admin (facility). doctorId accepts only me/own ID for doctors and nurses unless patientId is set.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `appointment:read`.",
+        "description": "Default scope: patient (own), doctor (own schedule), nurse (own department, or a clinical patientId), admin (facility). doctorId accepts only me/own ID for doctors unless patientId is set; nurses need patientId for doctorId (400). Facility admins' doctorId lists stay pinned to their facility; admins cannot combine doctorId and departmentId (400).\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `appointment:read`.",
         "tags": [
           "Appointments"
         ],
@@ -10118,7 +10121,7 @@
     "/api/v1/shifts": {
       "get": {
         "summary": "The roster for a window, sorted by start",
-        "description": "Scoped to the caller's facility. staffId accepts me. System admins must pass facilityId, departmentId or staffId (400 otherwise); facilityId is for system admins only. Window at most 31 days (default: today plus 7 days). handoverNote is visible only to the owner and to doctors and nurses of the same department.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `shift:read`.",
+        "description": "Scoped to the caller's facility (a colleague's staffId list only returns shifts recorded in the caller's facility). staffId accepts me. System admins must pass facilityId, departmentId or staffId (400 otherwise); facilityId is for system admins only. Window at most 31 days (default: today plus 7 days). handoverNote is visible only to the owner and to doctors and nurses of the same department.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `shift:read`.",
         "tags": [
           "Shifts"
         ],
@@ -10820,11 +10823,11 @@
       },
       "patch": {
         "summary": "Rename or archive a channel (admins), or rename a group (participants)",
-        "description": "Participants cannot be changed in v1.\n\nRequires permission `conversation:read`.",
+        "description": "Channels need channel:manage; groups need the caller to be a participant (conversation:read). Participants cannot be changed in v1.\n\nRequires permission `channel:manage` or `conversation:read`.",
         "tags": [
           "Conversations"
         ],
-        "x-permission": "conversation:read",
+        "x-permission": "channel:manage | conversation:read",
         "security": [
           {
             "bearerAuth": []

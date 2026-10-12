@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { before, describe, test } from "node:test";
 import { promisify } from "node:util";
 import { Timestamp } from "firebase-admin/firestore";
-import { runMigration } from "../scripts/lib/migrate.js";
+import { resolveDefaultFacility, runMigration } from "../scripts/lib/migrate.js";
 import {
   DELETE,
   changedFields,
@@ -244,5 +244,22 @@ describe("migration run (emulator)", () => {
     await assert.rejects(run(process.execPath, ["scripts/migrate-v1.js", "--project", "curecloud1", "--confirm", "other"], { env }), /Refusing to run/);
     const { stdout } = await run(process.execPath, ["scripts/migrate-v1.js"], { env: process.env });
     assert.match(stdout, /Dry run/);
+  });
+
+  // Last: leaves two facilities behind, which the CLI dry run above would refuse.
+  test("the fallback facility is an existing one when facilities already exist", async () => {
+    assert.equal(resolveDefaultFacility([], undefined), "default");
+    assert.equal(resolveDefaultFacility(["f1"], undefined), "f1");
+    assert.throws(() => resolveDefaultFacility(["f1", "f2"], undefined), /--default-facility-id/);
+    assert.throws(() => resolveDefaultFacility(["f1"], "nope"), /does not exist/);
+
+    await db.collection("facilities").doc("f9").set({ name: "Seeded", type: "clinic", status: "active" });
+    await db.collection("users").doc("doc2").set({ name: "Dr. Late Arrival", email: "late@curecloud.test", role: "doctor", status: "active", facilityId: null, createdAt: Timestamp.now() });
+    await assert.rejects(runMigration(db), /2 facilities exist/);
+    await assert.rejects(runMigration(db, { defaultFacilityId: "nope" }), /does not exist/);
+    const report = await runMigration(db, { apply: true, defaultFacilityId: "f9" });
+    assert.equal(report.defaultFacilityId, "f9");
+    assert.equal(report.collections.facilities.migrated, 0);
+    assert.equal((await get("users/doc2")).facilityId, "f9");
   });
 });

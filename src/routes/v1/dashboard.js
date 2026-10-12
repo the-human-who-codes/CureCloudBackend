@@ -1,5 +1,5 @@
 // Role dashboards and the report summary (docs/domain-model.md §2.18, §4.2 "Dashboard and reports").
-import { dashboardSpecs, getDoc, ownPatient, reportSpecs, scoped, systemAdmin } from "../../authz/index.js";
+import { can, dashboardSpecs, getDoc, ownPatient, patientsById, reportSpecs, scoped, systemAdmin } from "../../authz/index.js";
 import { DAY, addMs, sastParts, startOfSastDay, toDate } from "../../lib/dates.js";
 import { count, fetchAll } from "../../lib/firestore-query.js";
 import { badRequest, forbidden } from "../../lib/problem.js";
@@ -27,14 +27,25 @@ async function counters(specs) {
   return Object.fromEntries(entries);
 }
 
+const TASK_CAP = 500;
+
+// Open tasks due today that the nurse may read: patient tasks need clinical access to the patient
+// at request time (§2.10), so department scope alone never surfaces a discharged patient's task.
+async function visibleDueTasks(user, s) {
+  const docs = await fetchAll(s, { limit: TASK_CAP });
+  const byId = await patientsById(docs.map((d) => d.get("patientId")));
+  return docs.filter((d) => can(user, "care-task:read", raw(d), { patient: byId.get(d.get("patientId")) }));
+}
+
 async function nurseDashboard(user, now, specs) {
-  const { overdueTasks, ...countSpecs } = specs;
-  const [counts, schedule, critical, overdue] = await Promise.all([
+  const { dueTasks, ...countSpecs } = specs;
+  const [counts, schedule, critical, tasks] = await Promise.all([
     counters(countSpecs),
     medicationSchedule(user),
     fetchAll(scoped.patients(user, { acuity: "critical" }), { limit: 5 }),
-    fetchAll(overdueTasks, { limit: 5 }),
+    visibleDueTasks(user, dueTasks),
   ]);
+  const overdue = tasks.filter((d) => toDate(d.get("dueAt")) < now).slice(0, 5);
   const alerts = [
     ...critical.map((d) => ({
       type: "critical-patient",
@@ -65,7 +76,7 @@ async function nurseDashboard(user, now, specs) {
     role: "nurse",
     counters: {
       patientsUnderCare: counts.patientsUnderCare,
-      tasksDueToday: counts.tasksDueToday,
+      tasksDueToday: tasks.length,
       medicationsDueNow,
       criticalPatients: counts.criticalPatients,
     },
@@ -221,7 +232,8 @@ export function register(router) {
     path: "/dashboard",
     permission: "dashboard:read",
     summary: "Role-specific dashboard counters (discriminated by role)",
-    description: "Counts are count() aggregations; the nurse medication counters come from today's medication schedule.",
+    description:
+      "Counts are count() aggregations; the nurse medication counters come from today's medication schedule, and tasksDueToday and the overdue-task alerts only include tasks the nurse may read (patient tasks need current clinical access; at most 500 tasks are considered).",
     tags: ["Dashboard"],
     responses: { 200: Dashboard },
     async handler(req, res) {

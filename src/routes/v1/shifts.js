@@ -1,7 +1,7 @@
 // Shifts, the roster and handover notes (docs/domain-model.md §2.12, §4.2 "Care tasks and shifts").
 import { Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebase.js";
-import { authorize, can, getDoc, isStaff, queries, redact, scoped, systemAdmin } from "../../authz/index.js";
+import { authorize, can, department, getDoc, isStaff, queries, redact, scoped, systemAdmin } from "../../authz/index.js";
 import { writeAudit } from "../../lib/audit.js";
 import { DAY, HOUR, addMs, startOfSastDay, toDate } from "../../lib/dates.js";
 import { fetchAll, fetchInTx, paginate } from "../../lib/firestore-query.js";
@@ -54,7 +54,7 @@ export function register(router) {
     permission: "shift:read",
     summary: "The roster for a window, sorted by start",
     description:
-      "Scoped to the caller's facility. staffId accepts me. System admins must pass facilityId, departmentId or staffId (400 otherwise); facilityId is for system admins only. Window at most 31 days (default: today plus 7 days). handoverNote is visible only to the owner and to doctors and nurses of the same department.",
+      "Scoped to the caller's facility (a colleague's staffId list only returns shifts recorded in the caller's facility). staffId accepts me. System admins must pass facilityId, departmentId or staffId (400 otherwise); facilityId is for system admins only. Window at most 31 days (default: today plus 7 days). handoverNote is visible only to the owner and to doctors and nurses of the same department.",
     tags: ["Shifts"],
     request: { query: ShiftListQuery },
     responses: { 200: ShiftPage },
@@ -203,7 +203,10 @@ export async function currentShift(user, now = new Date()) {
   let previousHandover = null;
   if (isStaff(user) && departmentId) {
     const previous = (await fetchAll(queries.previousShifts(departmentId, now), { limit: 10 })).map(raw);
-    const last = previous.find((s) => s.handoverNote && s.status === "scheduled" && s.id !== mine?.id);
+    // Same rule as the Shift redactor (§3.4): being rostered into a department is not enough.
+    const last = previous.find(
+      (s) => s.handoverNote && s.status === "scheduled" && s.id !== mine?.id && department(user, s),
+    );
     if (last) previousHandover = { note: last.handoverNote, staffName: last.staffName, at: toJson(last.handoverAt ?? last.end) };
   }
 

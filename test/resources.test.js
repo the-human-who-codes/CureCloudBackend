@@ -2,7 +2,7 @@
 // care tasks, shifts, the medication schedule, conversations, settings, alerts, dashboards and reports.
 import assert from "node:assert/strict";
 import { before, describe, test } from "node:test";
-import { as, audit, db, googleUser, resetEmulators, sastDay, seedDepartment, seedFacility, staffUser } from "./helpers.js";
+import { as, audit, db, googleUser, resetEmulators, sastDay, seedDepartment, seedFacility, staffUser, weekdaySlot } from "./helpers.js";
 
 describe("v1 resources", () => {
   const u = {};
@@ -410,6 +410,15 @@ describe("v1 resources", () => {
 
   describe("discharge", () => {
     test("moves the admission to history", async () => {
+      // An overdue patient task on the ward: on the nurse dashboard until the patient leaves the ward.
+      const overdue = await as(u.d1.token)
+        .post("/care-tasks", { patientId: ids.w, title: "HIV viral load follow-up", category: "other", dueAt: new Date(Date.now() + 3600e3).toISOString() })
+        .expect(201);
+      await db.collection("careTasks").doc(overdue.body.id).update({ dueAt: new Date(Date.now() - 3600e3) });
+      const isAlert = (a) => a.type === "overdue-task" && a.message === "Overdue: HIV viral load follow-up";
+      const before = await as(u.n1.token).get("/dashboard").expect(200);
+      assert.ok(before.body.alerts.some(isAlert));
+
       const res = await as(u.d1.token).post(`/patients/${ids.w}/admission/discharge`, { dischargeNote: "Home" }).expect(200);
       assert.equal(res.body.admission, null);
       const history = await db.collection("patients").doc(ids.w).collection("admissions").get();
@@ -422,6 +431,55 @@ describe("v1 resources", () => {
       const tasks = await as(u.n1.token).get("/care-tasks?status=open,in-progress,completed").expect(200);
       assert.ok(!tasks.body.data.some((t) => t.patientId === ids.w));
       await as(u.d1.token).get(`/care-tasks/${ids.task}`).expect(200); // still on the care team
+      const after = await as(u.n1.token).get("/dashboard").expect(200);
+      assert.ok(!after.body.alerts.some(isAlert));
+      assert.ok(!after.body.alerts.some((a) => a.patientId === ids.w));
+      assert.equal(after.body.counters.tasksDueToday, before.body.counters.tasksDueToday - 1);
+
+      // deceasedAt only goes with status deceased.
+      await as(u.d1.token).patch(`/patients/${ids.w}`, { deceasedAt: "2026-01-01" }).expect(400);
+      await as(u.d1.token).patch(`/patients/${ids.w}/admission`, { room: "5" }).expect(409);
+    });
+  });
+
+  describe("filters", () => {
+    test("unsupported appointment filter combinations are rejected", async () => {
+      await as(u.admin.token).get(`/appointments?doctorId=${u.d1.uid}&departmentId=ward1`).expect(400);
+      await as(u.n1.token).get("/appointments?doctorId=me").expect(400);
+      const me = await as(u.p.token).post("/me", { birthDate: "04/05/1990" }).expect(400);
+      assert.equal(me.body.errors[0].path, "birthDate");
+    });
+  });
+
+  describe("staff who move facility", () => {
+    test("old appointments, shifts and other departments' handovers stay out of scope", async () => {
+      const now = Date.now();
+      const iso = (ms) => new Date(ms).toISOString();
+      u.d3 = await staffUser("d3@curecloud.test", "doctor", { name: "Doctor Three", facilityId: "f1" });
+      u.admin2 = await staffUser("admin2@curecloud.test", "admin", { name: "Second Admin", facilityId: "f2" });
+
+      // Rostered into Ward 1 without belonging to it: no Ward 1 handover note (§3.4).
+      await as(u.admin.token).post("/shifts", { staffId: u.d3.uid, type: "day", start: iso(now - 3600e3), end: iso(now + 3600e3), departmentId: "ward1" }).expect(201);
+      const current = await as(u.d3.token).get("/shifts/current").expect(200);
+      assert.ok(current.body.shift);
+      assert.equal(current.body.previousHandover, null);
+
+      const appt = await as(u.p.token)
+        .post("/appointments", { doctorId: u.d3.uid, start: weekdaySlot(4, "10:00"), type: "check-up", reason: "Check-up" })
+        .expect(201);
+      assert.equal(appt.body.facilityId, "f1");
+      await db.collection("users").doc(u.d3.uid).update({ facilityId: "f2" });
+
+      const appts = await as(u.admin2.token).get(`/appointments?doctorId=${u.d3.uid}`).expect(200);
+      assert.equal(appts.body.data.length, 0);
+      await as(u.admin2.token).get(`/appointments/${appt.body.id}`).expect(404);
+      await as(u.admin.token).get(`/appointments?doctorId=${u.d3.uid}`).expect(403); // no longer in f1
+      assert.equal((await as(u.sys.token).get(`/appointments?doctorId=${u.d3.uid}`).expect(200)).body.data.length, 1);
+
+      const window = `from=${encodeURIComponent(iso(now - 86400e3))}&to=${encodeURIComponent(iso(now + 86400e3))}`;
+      const shifts = await as(u.admin2.token).get(`/shifts?staffId=${u.d3.uid}&${window}`).expect(200);
+      assert.equal(shifts.body.data.length, 0);
+      assert.equal((await as(u.d3.token).get(`/shifts?staffId=me&${window}`).expect(200)).body.data.length, 1);
     });
   });
 });

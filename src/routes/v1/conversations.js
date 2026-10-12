@@ -203,9 +203,9 @@ export function register(router) {
   defineRoute(router, {
     method: "patch",
     path: "/conversations/{id}",
-    permission: "conversation:read",
+    permission: ["channel:manage", "conversation:read"],
     summary: "Rename or archive a channel (admins), or rename a group (participants)",
-    description: "Participants cannot be changed in v1.",
+    description: "Channels need channel:manage; groups need the caller to be a participant (conversation:read). Participants cannot be changed in v1.",
     tags: ["Conversations"],
     request: { params: idParam, body: ConversationUpdateRequest },
     responses: { 200: Conversation },

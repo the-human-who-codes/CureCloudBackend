@@ -4,7 +4,8 @@
 //   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run migrate -- --apply      # emulator, write
 //   npm run migrate -- --project <id> --confirm <id> [--apply]             # a real project (owner only)
 //
-// Options: --default-facility-name "<name>" (used when no facility exists yet).
+// Options: --default-facility-name "<name>" (used when no facility exists yet),
+//          --default-facility-id <id> (the fallback facility when several already exist).
 import { parseArgs } from "node:util";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
@@ -16,6 +17,7 @@ const { values } = parseArgs({
     project: { type: "string" },
     confirm: { type: "string" },
     "default-facility-name": { type: "string" },
+    "default-facility-id": { type: "string" },
   },
 });
 
@@ -34,5 +36,6 @@ const db = getFirestore(initializeApp({ projectId }));
 const report = await runMigration(db, {
   apply: values.apply,
   ...(values["default-facility-name"] && { defaultFacilityName: values["default-facility-name"] }),
+  ...(values["default-facility-id"] && { defaultFacilityId: values["default-facility-id"] }),
 });
 console.log(formatReport(report));

@@ -117,7 +117,7 @@ export function register(router) {
     permission: "appointment:read",
     summary: "List appointments, sorted by start",
     description:
-      "Default scope: patient (own), doctor (own schedule), nurse (own department, or a clinical patientId), admin (facility). doctorId accepts only me/own ID for doctors and nurses unless patientId is set.",
+      "Default scope: patient (own), doctor (own schedule), nurse (own department, or a clinical patientId), admin (facility). doctorId accepts only me/own ID for doctors unless patientId is set; nurses need patientId for doctorId (400). Facility admins' doctorId lists stay pinned to their facility; admins cannot combine doctorId and departmentId (400).",
     tags: ["Appointments"],
     request: { query: AppointmentListQuery },
     responses: { 200: AppointmentPage },
