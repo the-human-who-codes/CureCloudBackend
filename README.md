@@ -52,18 +52,39 @@ Deploy setup (one-off):
 
 Until the secret exists, the deploy job is skipped and only tests run.
 
+## Data model
+
+[`docs/domain-model.md`](docs/domain-model.md) is the contract: entity shapes, the authorization model, the
+`/api/v1` endpoints and the page-to-endpoint mapping. The zod schemas in `src/models/` (one module per entity:
+stored document, requests, response) implement it, and `src/authz/` holds every authorization decision
+(role-to-permission matrix, relationship rules, field redaction and scoped list queries).
+
+Stored documents carry `schemaVersion: 2`. Older documents are upgraded by the idempotent migration, which only
+runs against the emulator unless a project is named and confirmed:
+
+```sh
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run migrate             # dry run: counts and sample diffs (IDs only)
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run migrate -- --apply
+npm run migrate -- --project <id> --confirm <id> [--apply]          # owner only; deploy indexes first
+```
+
 ## Roles & access
 
-| Role    | How they get it                                                       | Sees                                       |
-| ------- | --------------------------------------------------------------------- | ------------------------------------------ |
-| patient | First Google sign-in → `POST /api/me`                                 | Only their own data                        |
-| doctor  | `POST /api/auth/signup` → admin approves                              | Patients on their care team                |
-| nurse   | `POST /api/auth/signup` → admin approves                              | Patients on their care team                |
-| admin   | `POST /api/me` with a verified email matching `BOOTSTRAP_ADMIN_EMAIL` | Everything; manages users and care teams   |
+| Role    | How they get it                                                       | Sees                                                     |
+| ------- | --------------------------------------------------------------------- | -------------------------------------------------------- |
+| patient | First Google sign-in → `POST /api/v1/me`                              | Their own record, care team conversations                |
+| doctor  | `POST /api/v1/auth/signup` → verify email → admin approves            | Patients on their care team (clinical access)            |
+| nurse   | `POST /api/v1/auth/signup` → verify email → admin approves            | Care team patients plus patients admitted to their ward  |
+| admin   | System admin: `POST /api/v1/me` with a verified `BOOTSTRAP_ADMIN_EMAIL`. Facility admin: promoted by a system admin | Accounts, organisation, scheduling and demographics of their facility (system admins: all). No clinical content |
 
-Booking an appointment adds the doctor to the patient's care team. Inaccessible patients return 404.
+Booking an appointment adds the doctor to the patient's care team. A resource the caller has no relationship
+to returns 404; a visible resource with a forbidden action or field returns 403. `GET /api/v1/me` returns the
+caller's `permissions`.
 
 ## Endpoints
+
+> Outdated: this table describes the pre-v1 API. The v1 endpoints are in
+> [`docs/domain-model.md` §4](docs/domain-model.md#4-api-surface); Swagger UI replaces this table next.
 
 All under `/api`. List endpoints accept `?limit=` (default 50, max 100).
 

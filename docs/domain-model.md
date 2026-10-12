@@ -1098,7 +1098,7 @@ v1 endpoints. A read API for admins and a patient-facing access history are **De
 
 ### 3.1 Principles
 
-1. **One policy module.** `src/lib/policy.js` holds every authorization decision. Routes do not compare
+1. **One policy module.** `src/authz/` holds every authorization decision. Routes do not compare
    roles or IDs inline.
 2. **Two layers.**
    - *Role permissions* (`resource:action`) answer "can this role ever do X?".
@@ -1171,7 +1171,7 @@ hide actions. The server still enforces every rule.
 
 ### 3.3 Relationship and attribute rules
 
-These are pure functions over `(user, resource)`, defined once in `policy.js`:
+These are pure functions over `(user, resource)`, defined once in `src/authz/rules.js`:
 
 | Rule          | Definition |
 | ------------- | ---------- |
@@ -1261,7 +1261,7 @@ a self-registered patient has `identifier: null` until staff register them.
 ### 3.6 Module shape
 
 ```js
-// src/lib/policy.js
+// src/authz/ (index.js re-exports permissions, rules, policy, redact, scoped, query and loaders)
 export const ROLE_PERMISSIONS = { patient: [...], nurse: [...], doctor: [...], admin: [...] };
 
 export function hasPermission(user, permission);                 // matrix only
@@ -1291,7 +1291,7 @@ export async function loadPatient(user, patientId, action);      // get + author
 - Routes call `requirePermission(...)` (role check), then `loadX` + `authorize` (relationship check), then
   `redact` before responding.
 - `requireRole` and `src/lib/access.js` are removed.
-- `policy.js` has no Firestore writes and the predicates are pure, so most of it is unit-tested without
+- `src/authz/` has no Firestore writes (only the loaders read) and the predicates are pure, so most of it is unit-tested without
   emulators (`test/policy.test.js`).
 
 ---
@@ -1701,9 +1701,9 @@ Explicitly out of scope for this iteration. The UI hides or removes these contro
 
 Backend layout:
 
-- `src/lib/policy.js` (section 3) and `src/lib/problem.js` (`HttpProblem` + error handler).
-- `src/lib/pagination.js` (cursor encode and decode of `[...orderByValues, id]`, page) and `src/lib/dates.js`
-  (SAST helpers, slot alignment, opening hours check).
+- `src/authz/` (section 3) and `src/lib/problem.js` (`HttpProblem` + error handler).
+- `src/lib/firestore-query.js` (executes query specs; cursor encode and decode of `[...orderByValues, id]`,
+  page) and `src/lib/dates.js` (SAST helpers, slot alignment, opening hours check).
 - `src/lib/route.js`: `defineRoute(router, { method, path, permission, request, responses })`, which mounts
   the handler and registers the OpenAPI operation from the same call ([1.11](#111-api-documentation-openapi--swagger)).
 - `src/lib/audit.js`: `writeAudit(txOrBatch, actor, { action, resource, patientId?, changedFields })`, which
@@ -1711,7 +1711,7 @@ Backend layout:
   ([2.20](#220-auditevent)). `changedFields` is computed from the validated patch keys, never from values.
 - `src/lib/identifiers.js`: HMAC-SHA256 of `"{type}:{value}"` with `PATIENT_IDENTIFIER_KEY`
   (`defineSecret`; `demo-identifier-key` under the emulator).
-- `src/schemas/*.js`: zod entity, request and response schemas, registered in an OpenAPI registry.
+- `src/models/*.js`: zod entity, request and response schemas (one module per entity), registered in an OpenAPI registry.
 - `src/routes/v1/*.js`: one router per resource. `src/openapi.js` builds the document.
 
 Writes that touch more than one document use transactions or batches: booking with slots and care team,
