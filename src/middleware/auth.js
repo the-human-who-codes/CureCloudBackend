@@ -1,36 +1,27 @@
 import { auth, db } from "../firebase.js";
-import { HttpError, forbidden, serialize } from "../lib/http.js";
+import { problem } from "../lib/problem.js";
 
-// Verifies the Firebase ID token and loads the caller's profile from users/{uid}.
+// Verifies the Firebase ID token and loads the caller's profile from users/{uid}. The profile keeps
+// Firestore types (it is only used for policy checks); it is serialized through redact() when returned.
 export async function authenticate(req, _res, next) {
   const match = (req.get("authorization") ?? "").match(/^Bearer (.+)$/);
-  if (!match) throw new HttpError(401, "Missing bearer token");
+  if (!match) throw problem("unauthenticated", "Missing bearer token");
 
   let decoded;
   try {
     decoded = await auth.verifyIdToken(match[1]);
   } catch {
-    throw new HttpError(401, "Invalid or expired token");
+    throw problem("unauthenticated", "Invalid or expired token");
   }
 
   const snap = await db.collection("users").doc(decoded.uid).get();
   req.auth = {
     uid: decoded.uid,
-    email: decoded.email ?? null,
+    email: decoded.email?.toLowerCase() ?? null,
     emailVerified: decoded.email_verified === true,
     name: decoded.name ?? null,
+    picture: decoded.picture ?? null,
   };
-  req.user = snap.exists ? serialize(snap) : null;
+  req.user = snap.exists ? { id: snap.id, ...snap.data() } : null;
   next();
 }
-
-// Requires an active profile, optionally with one of the given roles.
-export const requireRole =
-  (...roles) =>
-  (req, _res, next) => {
-    if (!req.user) throw forbidden("Profile not found. Complete sign-up via POST /api/me first.");
-    if (req.user.status === "pending") throw forbidden("Your account is awaiting admin approval");
-    if (req.user.status !== "active") throw forbidden("Your account is disabled");
-    if (roles.length && !roles.includes(req.user.role)) throw forbidden();
-    next();
-  };

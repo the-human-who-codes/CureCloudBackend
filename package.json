@@ -1,5 +1,6 @@
 {
   "name": "curecloud-backend",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "main": "index.js",
@@ -9,7 +10,7 @@
   "scripts": {
     "serve": "firebase emulators:start",
     "seed": "node scripts/seed.js",
-    "test": "firebase emulators:exec --project demo-curecloud --only auth,firestore \"node --test test/*.test.js\"",
+    "test": "firebase emulators:exec --project demo-curecloud --only auth,firestore \"VALIDATE_RESPONSES=1 node --test --test-concurrency=1 test/*.test.js\"",
     "deploy": "firebase deploy --only functions,firestore",
     "logs": "firebase functions:log"
   },
