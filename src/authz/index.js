@@ -9,7 +9,7 @@ export { authorize, can } from "./policy.js";
 export { redact, writableFields } from "./redact.js";
 export { dashboardSpecs, queries, reportSpecs, scoped } from "./scoped.js";
 export { eq, indexServes, queryShapes, spec } from "./query.js";
-export { getDoc, loadPatient, ownPatient, patientsById, resolvePatientFilter } from "./loaders.js";
+export { getDoc, loadPatient, ownPatient, patientsById, resolvePatientFilter, visibleDocs } from "./loaders.js";
 
 // Account status first (§3.1): only active accounts pass.
 export function requireActive(user) {

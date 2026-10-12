@@ -1211,6 +1211,16 @@ narrow their own data). Admins may filter appointments by any `doctorId` whose `
 have no access to the other clinical lists. For care tasks, nurses may also use `assigneeId=unassigned` and
 any `assigneeId` of a nurse in their own department, because department scope is applied in the same query.
 
+**Actor-only lists keep the detail rule.** When the query is pinned only by the caller's own actor ID
+(`prescriberId`, `authorId` or `performerId` = `me`, no `patientId`), it cannot express `clinical` access,
+so the route loads the page's distinct patients with one `getAll` and keeps only the items whose `:read`
+rule passes, exactly as `GET /{id}` would. A doctor removed from the care team, or a nurse whose patient is
+discharged or transferred, stops seeing their own prescriptions, records and administrations for that
+patient in the list as well as in the detail. A filtered page may hold fewer than `limit` items (possibly
+none); `nextCursor` still follows the underlying query. Aggregate counters over the caller's own work (the
+doctor dashboard `preliminaryRecords` and `activePrescriptions`, and the doctor report's prescription
+summary) are counts and medication names only, with no patient identity, and are not filtered.
+
 ### 3.4 Field-level rules
 
 Applied by `redact(user, type, doc)` on every serialized document, including list items and embedded
@@ -1403,13 +1413,13 @@ task drops out once the patient is discharged or transferred ([2.10](#210-careta
 
 | St | Method | Path                                         | Permission                          | Request / query | Response |
 | -- | ------ | -------------------------------------------- | ----------------------------------- | --------------- | -------- |
-| C  | GET    | `/prescriptions?patientId=&prescriberId=&status=&category=` | `prescription:read` | Patients: own. Doctors without `patientId`: `prescriberId` defaults to and must be `me`/own ID (`403` otherwise); with a clinical `patientId`, any `prescriberId` narrows that patient's list. Nurses must pass a clinical `patientId` (`400 validation-error` without one; `404` if it is not clinical). Sorted by `createdAt` desc. Excludes `entered-in-error` unless asked | page of `Prescription` |
+| C  | GET    | `/prescriptions?patientId=&prescriberId=&status=&category=` | `prescription:read` | Patients: own. Doctors without `patientId`: `prescriberId` defaults to and must be `me`/own ID (`403` otherwise); with a clinical `patientId`, any `prescriberId` narrows that patient's list. Nurses must pass a clinical `patientId` (`400 validation-error` without one; `404` if it is not clinical). Actor-only pages are filtered to patients still clinical ([3.3](#33-relationship-and-attribute-rules)). Sorted by `createdAt` desc. Excludes `entered-in-error` unless asked | page of `Prescription` |
 | C  | POST   | `/prescriptions`                             | `prescription:create`               | `{ patientId, medication, dose, route?, frequency, frequencyText?, administrationTimes?, instructions?, refills?, startDate, endDate?, category?, appointmentId? }` | `201 Prescription` |
 | N  | GET    | `/prescriptions/{id}`                        | `prescription:read`                 | – | `Prescription` |
 | C  | PATCH  | `/prescriptions/{id}`                        | `prescription:update`               | `{ status?, statusReason?, endDate?, refills?, instructions?, administrationTimes? }` | `Prescription` |
 | N  | POST   | `/prescriptions/{id}/refill-requests`        | `prescription:request-refill`       | `{ note? }` (≤500) | `202 { status: "requested" }`. Notifies the prescriber; nothing else is stored (refill workflow **Deferred**) |
 | N  | GET    | `/medication-schedule?date=&departmentId=`   | `medication-schedule:read`          | `date` defaults to today (SAST). `departmentId` is for nurses only and must be their own department (`403` otherwise); it only narrows the accessible inpatients to that ward | `{ data: ScheduledDose[], prn: Prescription[] }` (not paginated) |
-| N  | GET    | `/medication-administrations?patientId=&prescriptionId=&performerId=&from=&to=` | `medication-administration:read` | At least one of `patientId`, `prescriptionId` (its patient must be clinical or self) or `performerId`. Without a clinical `patientId`/`prescriptionId`, `performerId` must be `me`/own ID (`403` otherwise). Sorted by `occurredAt` desc | page of `MedicationAdministration` |
+| N  | GET    | `/medication-administrations?patientId=&prescriptionId=&performerId=&from=&to=` | `medication-administration:read` | At least one of `patientId`, `prescriptionId` (its patient must be clinical or self) or `performerId`. Without a clinical `patientId`/`prescriptionId`, `performerId` must be `me`/own ID (`403` otherwise); such pages are filtered to patients still clinical ([3.3](#33-relationship-and-attribute-rules)). Sorted by `occurredAt` desc | page of `MedicationAdministration` |
 | N  | POST   | `/medication-administrations`                | `medication-administration:create`  | `{ prescriptionId, scheduledFor?, status: "completed"\|"not-done", statusReason?, occurredAt?, dose?, notes? }` | `201 MedicationAdministration`. With `scheduledFor`, creates the `administrationSlots` lock in the same transaction; `409 already-charted` if a live administration holds it ([2.9](#29-medicationadministration)) |
 | N  | PATCH  | `/medication-administrations/{id}`           | `medication-administration:retract` | `{ status: "entered-in-error", statusReason }` | `MedicationAdministration`. Releases the slot lock in the same transaction, so the dose can be re-charted |
 
@@ -1417,7 +1427,7 @@ task drops out once the patient is discharged or transferred ([2.10](#210-careta
 
 | St | Method | Path                                | Permission              | Request / query | Response |
 | -- | ------ | ----------------------------------- | ----------------------- | --------------- | -------- |
-| C  | GET    | `/medical-records?patientId=&authorId=&category=&status=` | `medical-record:read` | Patients: own, final and amended only. Doctors and nurses without `patientId`: `authorId` defaults to and must be `me`/own ID (`403` otherwise). Sorted by `effectiveAt` desc | page of `MedicalRecord` |
+| C  | GET    | `/medical-records?patientId=&authorId=&category=&status=` | `medical-record:read` | Patients: own, final and amended only. Doctors and nurses without `patientId`: `authorId` defaults to and must be `me`/own ID (`403` otherwise); such pages are filtered to patients still clinical ([3.3](#33-relationship-and-attribute-rules)). Sorted by `effectiveAt` desc | page of `MedicalRecord` |
 | C  | POST   | `/medical-records`                  | `medical-record:create` | `{ patientId, category, title, effectiveAt?, status?: "preliminary"\|"final", diagnosis?, diagnosisCode?, findings?, treatment?, recommendations?, labResults?, appointmentId? }` | `201 MedicalRecord` |
 | N  | GET    | `/medical-records/{id}`             | `medical-record:read`   | – | `MedicalRecord` |
 | C  | PATCH  | `/medical-records/{id}`             | `medical-record:update` | While preliminary: content fields and/or `status: "final"`. At any status: `{ status: "entered-in-error", statusReason }` | `MedicalRecord`. `409 record-immutable` |

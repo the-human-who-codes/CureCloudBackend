@@ -1,7 +1,7 @@
 // Medical records (docs/domain-model.md §2.11, §4.2 "Medical records").
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebase.js";
-import { authorize, getDoc, loadPatient, redact, resolvePatientFilter, scoped } from "../../authz/index.js";
+import { authorize, getDoc, loadPatient, redact, resolvePatientFilter, scoped, visibleDocs } from "../../authz/index.js";
 import { writeAudit } from "../../lib/audit.js";
 import { MINUTE } from "../../lib/dates.js";
 import { paginate } from "../../lib/firestore-query.js";
@@ -54,7 +54,7 @@ export function register(router) {
     permission: "medical-record:read",
     summary: "List medical records, newest effectiveAt first",
     description:
-      "Patients: their own, final and amended only. Doctors and nurses without patientId: authorId defaults to and must be me.",
+      "Patients: their own, final and amended only. Doctors and nurses without patientId: authorId defaults to and must be me, and only records for patients still clinical to the caller are returned (the page may hold fewer than limit items).",
     tags: ["Medical records"],
     request: { query: MedicalRecordListQuery },
     responses: { 200: MedicalRecordPage },
@@ -63,7 +63,8 @@ export function register(router) {
       const { limit, cursor, patientId, ...filters } = req.valid.query;
       const patient = await resolvePatientFilter(req.user, patientId, "medical-record:read");
       const page = await paginate(scoped.medicalRecords(req.user, filters, { patientId: patient?.id }), { limit, cursor });
-      res.json({ data: page.docs.map((d) => redact(req.user, "medical-record", serialize(d))), nextCursor: page.nextCursor });
+      const visible = await visibleDocs(req.user, "medical-record:read", page.docs, patient);
+      res.json({ data: visible.map((d) => redact(req.user, "medical-record", serialize(d))), nextCursor: page.nextCursor });
     },
   });
 

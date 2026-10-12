@@ -242,12 +242,13 @@ export function register(router) {
         throw badRequest("facilityId must be an existing facility");
       }
       const update = { ...body };
+      // Checked on the resulting values, so an explicit deceasedAt: null cannot leave a deceased
+      // patient without a date (§2.5). Leaving deceased clears the stored date.
       const status = body.status ?? patient.status;
-      if (status === "deceased" && !(body.deceasedAt ?? patient.deceasedAt)) {
-        throw badRequest("deceasedAt is required when status is deceased");
-      }
+      const deceasedAt = "deceasedAt" in body ? body.deceasedAt : patient.deceasedAt;
+      if (status === "deceased" && !deceasedAt) throw badRequest("deceasedAt is required when status is deceased");
       if (body.deceasedAt && status !== "deceased") throw badRequest("deceasedAt can only be set when status is deceased");
-      if (body.status && body.status !== "deceased") update.deceasedAt = null;
+      if (status !== "deceased") update.deceasedAt = null;
       if (body.name) update.nameLower = nameLower(body.name);
       if (body.chronicConditions) update.conditionCategories = conditionCategories(body.chronicConditions);
       const allergies = body.allergies ?? patient.allergies ?? [];
@@ -446,23 +447,30 @@ export function register(router) {
       for (const key of ["ward", "room", "bed", "attendingDoctorId"]) {
         if (body[key] !== undefined) update[key] = body[key];
       }
-      if (body.departmentId && body.departmentId !== patient.admission.departmentId) {
-        const dept = await loadDepartment(body.departmentId);
-        if (dept.facilityId !== patient.facilityId) throw badRequest("The department is in another facility");
-        update.departmentId = dept.id;
-        update.departmentName = dept.name;
-      }
+      const dept = body.departmentId ? await loadDepartment(body.departmentId) : null;
       await checkAttendingDoctor(body.attendingDoctorId);
-      // Re-checked in the transaction so a concurrent discharge or transfer cannot be overwritten
-      // with a partial admission (§8). The whole admission map is written, never dotted paths.
+      // Re-checked in the transaction so a concurrent discharge, readmission or transfer cannot be
+      // overwritten with a partial or stale admission (§8). Department decisions use the current
+      // document. The whole admission map is written, never dotted paths.
       const ref = patients.doc(patientId);
+      const admittedAt = patient.admission.admittedAt;
       await db.runTransaction(async (tx) => {
         const current = { id: patientId, ...(await tx.get(ref)).data() };
         if (!current.admission) throw invalidTransition("The patient is not admitted");
+        const now = current.admission.admittedAt;
+        if (!(now?.isEqual ? now.isEqual(admittedAt) : now === admittedAt)) {
+          throw conflict("The admission changed while this request was in flight");
+        }
         if (user.role === "nurse" && !ward(user, current)) {
           throw forbidden("Nurses can only move patients within their own department");
         }
-        tx.update(ref, { admission: { ...current.admission, ...update }, ...updatedFields(user) });
+        const change = { ...update };
+        if (dept && dept.id !== current.admission.departmentId) {
+          if (dept.facilityId !== current.facilityId) throw badRequest("The department is in another facility");
+          change.departmentId = dept.id;
+          change.departmentName = dept.name;
+        }
+        tx.update(ref, { admission: { ...current.admission, ...change }, ...updatedFields(user) });
         writeAudit(tx, user, { action: "update", resource: { type: "admission", id: patientId }, patientId, changedFields: Object.keys(body) });
       });
       res.json(patientResponse(user, await reload(patientId)));

@@ -8720,7 +8720,7 @@
     "/api/v1/prescriptions": {
       "get": {
         "summary": "List prescriptions, newest first",
-        "description": "Patients: their own. Doctors without patientId: prescriberId defaults to and must be me. Nurses must pass a clinical patientId (400 without one). Excludes entered-in-error unless asked for.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `prescription:read`.",
+        "description": "Patients: their own. Doctors without patientId: prescriberId defaults to and must be me, and only prescriptions for patients still clinical to the caller are returned (the page may hold fewer than limit items). Nurses must pass a clinical patientId (400 without one). Excludes entered-in-error unless asked for.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `prescription:read`.",
         "tags": [
           "Prescriptions"
         ],
@@ -9142,7 +9142,7 @@
     "/api/v1/medication-administrations": {
       "get": {
         "summary": "Administration history, newest first",
-        "description": "At least one of patientId, prescriptionId or performerId. Without a clinical patientId or prescriptionId, performerId must be me.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `medication-administration:read`.",
+        "description": "At least one of patientId, prescriptionId or performerId. Without a clinical patientId or prescriptionId, performerId must be me, and only administrations for patients still clinical to the caller are returned (the page may hold fewer than limit items).\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `medication-administration:read`.",
         "tags": [
           "Prescriptions"
         ],
@@ -9404,7 +9404,7 @@
     "/api/v1/medical-records": {
       "get": {
         "summary": "List medical records, newest effectiveAt first",
-        "description": "Patients: their own, final and amended only. Doctors and nurses without patientId: authorId defaults to and must be me.\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `medical-record:read`.",
+        "description": "Patients: their own, final and amended only. Doctors and nurses without patientId: authorId defaults to and must be me, and only records for patients still clinical to the caller are returned (the page may hold fewer than limit items).\n\nPaginated: `limit` (1-100, default 25) sets the page size; pass the previous page's `nextCursor` as `cursor` for the next page. `nextCursor` is null on the last page.\n\nRequires permission `medical-record:read`.",
         "tags": [
           "Medical records"
         ],

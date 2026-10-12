@@ -3,7 +3,7 @@
 import { db } from "../firebase.js";
 import { notFound } from "../lib/problem.js";
 import { raw } from "../lib/serialize.js";
-import { authorize } from "./policy.js";
+import { authorize, can } from "./policy.js";
 
 export const getDoc = async (collection, id) => raw(await db.collection(collection).doc(id).get());
 
@@ -40,4 +40,13 @@ export async function patientsById(ids) {
   if (!unique.length) return new Map();
   const snaps = await db.getAll(...unique.map((id) => db.collection("patients").doc(id)));
   return new Map(snaps.filter((s) => s.exists).map((s) => [s.id, raw(s)]));
+}
+
+// Keeps the docs of a list page whose patient the caller may still read under `permission`.
+// Actor-only lists (prescriberId, authorId, performerId = me) cannot express clinical access in the
+// query, so the page is filtered in memory: it may hold fewer than limit items, and nextCursor still
+// follows the underlying query. A known patient (a resolved patientId filter) skips the getAll.
+export async function visibleDocs(user, permission, docs, patient) {
+  const byId = patient ? new Map([[patient.id, patient]]) : await patientsById(docs.map((d) => d.get("patientId")));
+  return docs.filter((d) => can(user, permission, raw(d), { patient: byId.get(d.get("patientId")) }));
 }

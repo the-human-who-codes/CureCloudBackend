@@ -439,6 +439,55 @@ describe("v1 resources", () => {
       // deceasedAt only goes with status deceased.
       await as(u.d1.token).patch(`/patients/${ids.w}`, { deceasedAt: "2026-01-01" }).expect(400);
       await as(u.d1.token).patch(`/patients/${ids.w}/admission`, { room: "5" }).expect(409);
+      await as(u.d1.token).patch(`/patients/${ids.w}`, { status: "deceased" }).expect(400);
+      await as(u.d1.token).patch(`/patients/${ids.w}`, { status: "deceased", deceasedAt: "2026-10-01" }).expect(200);
+      // An explicit null cannot leave a deceased patient without a date.
+      await as(u.d1.token).patch(`/patients/${ids.w}`, { deceasedAt: null }).expect(400);
+      await as(u.d1.token).patch(`/patients/${ids.w}`, { status: "deceased", deceasedAt: null }).expect(400);
+      const stored = (await db.collection("patients").doc(ids.w).get()).data();
+      assert.equal(stored.status, "deceased");
+      assert.ok(stored.deceasedAt);
+      const revived = await as(u.d1.token).patch(`/patients/${ids.w}`, { status: "active" }).expect(200);
+      assert.equal(revived.body.deceasedAt ?? null, null);
+    });
+  });
+
+  describe("lists agree with the detail rules", () => {
+    test("own prescriptions, records and administrations drop out with clinical access", async () => {
+      const pid = (await as(u.admin.token).post("/patients", { name: "Secret Patient", sex: "female" }).expect(201)).body.id;
+      await as(u.admin.token).post(`/patients/${pid}/care-team`, { userId: u.d1.uid }).expect(201);
+      await as(u.d1.token).post(`/patients/${pid}/admission`, { departmentId: "ward1" }).expect(201);
+      const rx = await as(u.d1.token)
+        .post("/prescriptions", { patientId: pid, medication: "Tenofovir", dose: "300 mg", frequency: "as-needed", startDate: sastDay(-1) })
+        .expect(201);
+      const record = await as(u.d1.token)
+        .post("/medical-records", { patientId: pid, category: "lab-result", title: "HIV result", findings: "B20", status: "preliminary" })
+        .expect(201);
+      await as(u.n1.token).post("/medication-administrations", { prescriptionId: rx.body.id, status: "completed" }).expect(201);
+
+      const idsOf = (res) => res.body.data.map((d) => d.id);
+      const mine = async () => ({
+        rxs: idsOf(await as(u.d1.token).get("/prescriptions").expect(200)),
+        records: idsOf(await as(u.d1.token).get("/medical-records").expect(200)),
+      });
+      const given = async () => (await as(u.n1.token).get("/medication-administrations?performerId=me").expect(200)).body.data;
+      assert.ok((await mine()).rxs.includes(rx.body.id));
+      assert.ok((await mine()).records.includes(record.body.id));
+      assert.ok((await given()).some((a) => a.patientId === pid));
+
+      // Removed from the care team (the ward rule is for nurses): the lists now agree with the 404 detail.
+      await as(u.admin.token).delete(`/patients/${pid}/care-team/${u.d1.uid}`).expect(204);
+      await as(u.d1.token).get(`/prescriptions/${rx.body.id}`).expect(404);
+      await as(u.d1.token).get(`/medical-records/${record.body.id}`).expect(404);
+      const after = await mine();
+      assert.ok(!after.rxs.includes(rx.body.id));
+      assert.ok(!after.records.includes(record.body.id));
+
+      // The ward nurse keeps the administration until the patient leaves the ward.
+      assert.ok((await given()).some((a) => a.patientId === pid));
+      await as(u.admin.token).post(`/patients/${pid}/admission/discharge`, {}).expect(200);
+      await as(u.n1.token).get(`/medication-administrations?patientId=${pid}`).expect(404);
+      assert.ok(!(await given()).some((a) => a.patientId === pid));
     });
   });
 

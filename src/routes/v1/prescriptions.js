@@ -10,6 +10,7 @@ import {
   redact,
   resolvePatientFilter,
   scoped,
+  visibleDocs,
 } from "../../authz/index.js";
 import { writeAudit } from "../../lib/audit.js";
 import { DAY, MINUTE, isoWeekday, sastDate, sastInstant, sastParts } from "../../lib/dates.js";
@@ -79,7 +80,7 @@ export function register(router) {
     permission: "prescription:read",
     summary: "List prescriptions, newest first",
     description:
-      "Patients: their own. Doctors without patientId: prescriberId defaults to and must be me. Nurses must pass a clinical patientId (400 without one). Excludes entered-in-error unless asked for.",
+      "Patients: their own. Doctors without patientId: prescriberId defaults to and must be me, and only prescriptions for patients still clinical to the caller are returned (the page may hold fewer than limit items). Nurses must pass a clinical patientId (400 without one). Excludes entered-in-error unless asked for.",
     tags: ["Prescriptions"],
     request: { query: PrescriptionListQuery },
     responses: { 200: PrescriptionPage },
@@ -88,7 +89,8 @@ export function register(router) {
       const { limit, cursor, patientId, ...filters } = req.valid.query;
       const patient = await resolvePatientFilter(req.user, patientId, "prescription:read");
       const page = await paginate(scoped.prescriptions(req.user, filters, { patientId: patient?.id }), { limit, cursor });
-      res.json({ data: page.docs.map((d) => redact(req.user, "prescription", serialize(d))), nextCursor: page.nextCursor });
+      const visible = await visibleDocs(req.user, "prescription:read", page.docs, patient);
+      res.json({ data: visible.map((d) => redact(req.user, "prescription", serialize(d))), nextCursor: page.nextCursor });
     },
   });
 
@@ -287,7 +289,7 @@ export function register(router) {
     permission: "medication-administration:read",
     summary: "Administration history, newest first",
     description:
-      "At least one of patientId, prescriptionId or performerId. Without a clinical patientId or prescriptionId, performerId must be me.",
+      "At least one of patientId, prescriptionId or performerId. Without a clinical patientId or prescriptionId, performerId must be me, and only administrations for patients still clinical to the caller are returned (the page may hold fewer than limit items).",
     tags: ["Prescriptions"],
     request: { query: AdministrationListQuery },
     responses: { 200: MedicationAdministrationPage },
@@ -305,7 +307,8 @@ export function register(router) {
       const ctx = { patientId: patient?.id, prescriptionId };
       const s = scoped.medicationAdministrations(user, { ...filters, from: from && new Date(from), to: to && new Date(to) }, ctx);
       const page = await paginate(s, { limit, cursor });
-      res.json({ data: page.docs.map((d) => redact(user, "medication-administration", serialize(d))), nextCursor: page.nextCursor });
+      const visible = await visibleDocs(user, "medication-administration:read", page.docs, patient);
+      res.json({ data: visible.map((d) => redact(user, "medication-administration", serialize(d))), nextCursor: page.nextCursor });
     },
   });
 
