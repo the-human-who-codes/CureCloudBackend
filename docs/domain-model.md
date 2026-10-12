@@ -451,7 +451,9 @@ type Admission = { departmentId: string; departmentName: string /* snapshot */; 
                    attendingDoctorId?: string };
 ```
 
-Stored but not serialized: `nameLower` (search), `conditionCategories: string[]` (the 3-character ICD-10
+Stored but not serialized: `nameLower` (search), `admitted: boolean` (`admission != null`, written in the
+same update as `admission`; Firestore cannot filter on "field is not null" while sorting by `nameLower`, so
+`?admitted=` and the admitted counters use it), `conditionCategories: string[]` (the 3-character ICD-10
 prefixes of `chronicConditions[].code`, used by reports) and `legacy`.
 
 Admission history: discharge appends the closed admission (plus `dischargedAt`, `dischargedBy`,
@@ -949,7 +951,8 @@ Two rules keep this safe:
   `(field, orderBy)` composite per equality or array-contains field (Firestore's index merging combines
   them). A new filter without an index fails the test.
 - Filter combinations are restricted to keep the set finite. On `/users`, `q` combines only with `role`
-  and `status`. On `/patients`, `q` combines only with `acuity`. Other combinations return `400`.
+  and `status`. On `/patients`, `q` combines only with `acuity`, and `admitted` combines with neither `q`
+  nor `acuity`. Other combinations return `400`.
 
 | Collection                  | Fields                                                                 | Used by |
 | --------------------------- | ---------------------------------------------------------------------- | ------- |
@@ -962,6 +965,7 @@ Two rules keep this safe:
 | `patients`                  | `careTeam CONTAINS, acuity, nameLower`                                 | acuity filter, critical count |
 | `patients`                  | `admission.departmentId, nameLower` · `admission.departmentId, acuity, nameLower` | ward nurse list (OR branch) |
 | `patients`                  | `facilityId, nameLower`                                                | facility admin list (system admin uses the single-field `nameLower` index) |
+| `patients`                  | `admitted, nameLower`                                                  | `?admitted=` (merged with the scope index) and admitted counters |
 | `appointments`              | `patientId, start` · `doctorId, start` · `departmentId, start` · `facilityId, start` | lists (replace the `scheduledAt` indexes) |
 | `appointments`              | `patientId, status, start` · `doctorId, status, start` · `departmentId, status, start` · `facilityId, status, start` | status filters, counters |
 | `appointmentSlots`          | `doctorId, start`                                                      | busy times |
@@ -1559,7 +1563,7 @@ Script: `scripts/migrate-v1.js`.
 | ---------- | --------- |
 | `facilities` (new) | If none exist, create `facilities/default` `{ name: "CureCloud Demo Hospital", type: "hospital", status: "active" }`. Override with `--default-facility-name` |
 | `users` | `phoneNumber → phone` (normalized E.164). `nationalId → identifier` (`za-id` if 13 digits passing Luhn, otherwise `other`). `specialization → practitioner.specialization` for doctors and nurses (and `practitioner.licenceBody` from role). Staff with `facilityId: null` get `default`. Add `departmentId: null`, `nameLower`, `createdBy` (own UID). Admins keep `facilityId: null` (system admins); admins with a stray `practitioner` or `specialization` get it moved to `legacy`. For `role: patient`: `phone` and `emergencyContact` move to the linked patient (only where the patient field is empty) and the user copies go to `legacy` |
-| `patients` | `dateOfBirth → birthDate`. `priority → acuity`. `vitals → latestVitals` (with the vitals transform below). `room` → if non-null, `admission: { departmentId: null, departmentName: "Unassigned", room, admittedAt: createdAt, admittedBy: "system" }`, otherwise `admission: null`. `nextMed → legacy.nextMed`. Add `status: "active"`, `sex: "unknown"`, `allergies: []`, `noKnownAllergies: false`, `chronicConditions: []`, `conditionCategories: []`, `identifier: null`, `folderNumber: null`, `facilityId` (`default` if the care team is non-empty, else `null`), `nameLower`, and `email` (contact email, initialised from the linked user's sign-in email). `phone`/`emergencyContact` come from the user transform above |
+| `patients` | `dateOfBirth → birthDate`. `priority → acuity`. `vitals → latestVitals` (with the vitals transform below). `room` → if non-null, `admission: { departmentId: null, departmentName: "Unassigned", room, admittedAt: createdAt, admittedBy: "system" }`, otherwise `admission: null`; `admitted` is set to match. `nextMed → legacy.nextMed`. Add `status: "active"`, `sex: "unknown"`, `allergies: []`, `noKnownAllergies: false`, `chronicConditions: []`, `conditionCategories: []`, `identifier: null`, `folderNumber: null`, `facilityId` (`default` if the care team is non-empty, else `null`), `nameLower`, and `email` (contact email, initialised from the linked user's sign-in email). `phone`/`emergencyContact` come from the user transform above |
 | `patients/*/vitals` | `bloodPressure "120/80"` → `{ systolic: 120, diastolic: 80 }`. `bloodSugar` (mg/dL) → `bloodGlucose = round(bloodSugar / 18, 1)` mmol/L, original kept in `legacy.bloodSugar`. Add `status: "final"`, `createdBy = recordedBy`, `createdByName` (looked up), `patientId` |
 | `appointments` | `scheduledAt → start`. `end = start + 30 min`, `durationMinutes: 30`. `date`, `time → legacy`. `notes → reason`. `type` map: "General Checkup" → `check-up`, "Follow-up" → `follow-up`, "Consultation" → `consultation`, anything else → `other` (original in `legacy.type`). Add `facilityId`/`departmentId` from the doctor (`default` facility fallback) and `updatedBy`. Statuses are unchanged |
 | `appointmentSlots` | Add `{ doctorId, start }` fields to existing locks. For active appointments, `create()` the second 15-minute lock (`start + 15 min`) if missing. Grandfathered appointments not on a 15-minute boundary keep their single legacy lock |
@@ -1650,8 +1654,9 @@ Tests:
   includes another patient's account or staff not on their care team gets `403`.
 - Booking outside `openingHours` and during a doctor's `leave` shift returns `409 slot-unavailable`.
 - `PATCH /me` with `phone` as a patient returns `403`.
-- An audit test: a patient `PATCH` of `allergies` writes exactly one `auditEvents` document with
-  `changedFields: ["allergies"]` and no values.
+- An audit test: a clinician's `PATCH /patients/{id}` of `allergies` writes exactly one `auditEvents`
+  document with `changedFields: ["allergies"]` and no values (patients cannot write `allergies`, see
+  [3.4](#34-field-level-rules)).
 - The bootstrap admin test (existing) stays.
 - An OpenAPI coverage test (route list from `defineRoute` against the spec) and the index coverage test
   in [2.19](#219-index-summary).
