@@ -225,8 +225,9 @@ The frontend `ApiError` exposes `status`, `code`, `message` (= `detail ?? title`
 
 - The zod request and response schemas are the single source. They are registered with
   `@asteasolutions/zod-to-openapi` (zod 3 compatible) to generate an **OpenAPI 3.1** document.
-- `GET /api/v1/openapi.json` serves the spec. `GET /api/docs` serves Swagger UI (`swagger-ui-express`). Both
-  are public: they contain no data or secrets.
+- `GET /api/openapi.json` serves the spec (also committed as `docs/openapi.json` by `npm run openapi`). `GET
+  /api/docs` serves Swagger UI (`swagger-ui-dist`). Both are public (they contain no data or secrets) and
+  cacheable; data routes stay `Cache-Control: no-store`.
 - Every route registers its path, its `x-permission` (the permission string from section 3), its
   parameters, its request body, its responses and its problem types. Security scheme: `bearerAuth` (HTTP
   bearer, Firebase ID token).
@@ -1316,7 +1317,7 @@ Status column: **E** existing and unchanged, **C** changed (breaking), **N** new
 | St | Method | Path                    | Response | Notes |
 | -- | ------ | ----------------------- | -------- | ----- |
 | C  | GET    | `/api/health`           | `{ status: "ok", version }` | Unversioned. `version` comes from `package.json` |
-| N  | GET    | `/api/v1/openapi.json`  | OpenAPI 3.1 | |
+| N  | GET    | `/api/openapi.json`     | OpenAPI 3.1 | Unversioned, cacheable |
 | N  | GET    | `/api/docs`             | Swagger UI | |
 | C  | POST   | `/api/v1/auth/signup`   | `201 { id, status: "pending" }` | Body: `{ email, password (8–128), name, phone, role: "doctor"\|"nurse", identifier: Identifier, licenceNumber?, specialization? }`. Renamed `fullName → name`, `phoneNumber → phone`, `nationalId → identifier`. Raises a SystemAlert. `409 conflict` if the email equals `BOOTSTRAP_ADMIN_EMAIL` (same comparison as `POST /me`), so nobody can pre-register the bootstrap admin's address and lock the owner into a pending staff account. The account starts unverified; approval requires a verified email ([2.1](#21-user-account)) |
 
