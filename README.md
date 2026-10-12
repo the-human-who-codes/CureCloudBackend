@@ -52,53 +52,47 @@ Deploy setup (one-off):
 
 Until the secret exists, the deploy job is skipped and only tests run.
 
+## Data model
+
+[`docs/domain-model.md`](docs/domain-model.md) is the contract: entity shapes, the authorization model, the
+`/api/v1` endpoints and the page-to-endpoint mapping. The zod schemas in `src/models/` (one module per entity:
+stored document, requests, response) implement it, and `src/authz/` holds every authorization decision
+(role-to-permission matrix, relationship rules, field redaction and scoped list queries).
+
+Stored documents carry `schemaVersion: 2`. Older documents are upgraded by the idempotent migration, which only
+runs against the emulator unless a project is named and confirmed:
+
+```sh
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run migrate             # dry run: counts and sample diffs (IDs only)
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run migrate -- --apply
+npm run migrate -- --project <id> --confirm <id> [--apply]          # owner only; deploy indexes first
+```
+
 ## Roles & access
 
-| Role    | How they get it                                                       | Sees                                       |
-| ------- | --------------------------------------------------------------------- | ------------------------------------------ |
-| patient | First Google sign-in → `POST /api/me`                                 | Only their own data                        |
-| doctor  | `POST /api/auth/signup` → admin approves                              | Patients on their care team                |
-| nurse   | `POST /api/auth/signup` → admin approves                              | Patients on their care team                |
-| admin   | `POST /api/me` with a verified email matching `BOOTSTRAP_ADMIN_EMAIL` | Everything; manages users and care teams   |
+| Role    | How they get it                                                       | Sees                                                     |
+| ------- | --------------------------------------------------------------------- | -------------------------------------------------------- |
+| patient | First Google sign-in → `POST /api/v1/me`                              | Their own record, care team conversations                |
+| doctor  | `POST /api/v1/auth/signup` → verify email → admin approves            | Patients on their care team (clinical access)            |
+| nurse   | `POST /api/v1/auth/signup` → verify email → admin approves            | Care team patients plus patients admitted to their ward  |
+| admin   | System admin: `POST /api/v1/me` with a verified `BOOTSTRAP_ADMIN_EMAIL`. Facility admin: promoted by a system admin | Accounts, organisation, scheduling and demographics of their facility (system admins: all). No clinical content |
 
-Booking an appointment adds the doctor to the patient's care team. Inaccessible patients return 404.
+Booking an appointment adds the doctor to the patient's care team. A resource the caller has no relationship
+to returns 404; a visible resource with a forbidden action or field returns 403. `GET /api/v1/me` returns the
+caller's `permissions`.
 
-## Endpoints
+## API documentation
 
-All under `/api`. List endpoints accept `?limit=` (default 50, max 100).
+- **Swagger UI:** `GET /api/docs` (locally `http://127.0.0.1:5001/curecloud1/africa-south1/api/api/docs` under
+  `npm run serve`). Authorize with a Firebase ID token (`await auth.currentUser.getIdToken()` in the client)
+  to try requests.
+- **OpenAPI 3.1 document:** `GET /api/openapi.json`, also committed as [`docs/openapi.json`](docs/openapi.json).
+- **Contract:** [`docs/domain-model.md`](docs/domain-model.md) for entity shapes, the authorization model and the
+  page-to-endpoint mapping.
 
-| Method | Path                            | Who                        | Notes                                                              |
-| ------ | ------------------------------- | -------------------------- | ------------------------------------------------------------------ |
-| GET    | `/health`                       | public                     |                                                                    |
-| POST   | `/auth/signup`                  | public                     | Staff signup (matches `StaffSignUp.jsx`); account starts `pending` |
-| GET    | `/me`                           | signed in                  | 404 = needs onboarding. Patients also get `patient` (vitals etc.)  |
-| POST   | `/me`                           | signed in, no profile      | `{ name?, phoneNumber?, dateOfBirth? }`                            |
-| PATCH  | `/me`                           | any                        | `{ name?, phoneNumber? }`                                          |
-| GET    | `/doctors`                      | any                        | Booking directory                                                  |
-| GET    | `/users?role=&status=`          | admin                      |                                                                    |
-| PATCH  | `/users/:id`                    | admin                      | `{ role?, status?, facilityId?, specialization? }`                 |
-| GET    | `/patients`                     | doctor, nurse, admin       |                                                                    |
-| POST   | `/patients`                     | doctor, nurse, admin       | Walk-in patient without an account                                 |
-| GET    | `/patients/:id`                 | with access                |                                                                    |
-| PATCH  | `/patients/:id`                 | doctor, nurse, admin       | `{ room?, priority?, nextMed? }`; `careTeam` admin-only            |
-| GET    | `/patients/:id/vitals`          | with access                | History, newest first                                              |
-| POST   | `/patients/:id/vitals`          | doctor, nurse              | `{ bloodPressure, heartRate, weight, bloodSugar, temperature, oxygenSaturation }` (any subset) |
-| GET    | `/appointments?patientId=&upcoming=true` | any               | Patients: own; doctors: own schedule; nurses: `patientId` required |
-| POST   | `/appointments`                 | any                        | `{ doctorId, date: YYYY-MM-DD, time: HH:mm, type?, notes?, patientId? (staff) }`; 409 if slot taken |
-| PATCH  | `/appointments/:id`             | patient, doctor, admin     | `{ status?, date?+time?, type?, notes? }`; patients may only cancel/reschedule |
-| GET    | `/prescriptions?patientId=&status=` | any                    | Doctors without `patientId` get ones they wrote                    |
-| POST   | `/prescriptions`                | doctor                     | `{ patientId, medication, dosage, frequency, startDate, endDate?, refills?, notes? }` |
-| PATCH  | `/prescriptions/:id`            | prescribing doctor, admin  | `{ status?, refills?, endDate?, notes? }`                          |
-| GET    | `/medical-records?patientId=`   | any                        |                                                                    |
-| POST   | `/medical-records`              | doctor                     | `{ patientId, type, diagnosis?, treatment?, results?, recommendations?, appointmentId?, status? }` |
-| PATCH  | `/medical-records/:id`          | author                     | Only while `preliminary`; `final` records are immutable            |
-| GET    | `/notifications?unread=true`    | any                        | Own notifications                                                  |
-| PATCH  | `/notifications/:id/read`       | owner                      |                                                                    |
-| POST   | `/notifications/read-all`       | any                        |                                                                    |
-| GET    | `/admin/stats`                  | admin                      | `{ totalDoctors, totalNurses, totalPatients, pendingStaff, activeAppointments }` |
-
-Enums are lowercase: priority `stable|moderate|high|critical`, appointment status
-`pending|confirmed|cancelled|completed`, prescription status `active|completed|discontinued`.
-Times are SAST (UTC+2).
+The document is generated from the zod models in `src/models/` and the `defineRoute` calls in `src/routes/v1/`
+(`src/openapi.js`); there is no hand-written spec. Each operation lists its required permission, parameters,
+request body, responses and problem+json errors. After changing a route or model, run `npm run openapi` and commit
+`docs/openapi.json`; `npm test` fails if it is out of date or if any route is undocumented.
 
 The frontend wrapper in CureCloud's `client/src/api/client.js` exposes each endpoint as a function.

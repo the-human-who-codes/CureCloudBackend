@@ -17,7 +17,7 @@ export function cors(req, res, next) {
   if (req.method === "OPTIONS") {
     if (!origin || !isAllowed(origin)) return res.status(403).end();
     res.set({
-      "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Authorization, Content-Type",
       "Access-Control-Max-Age": "7200", // browsers cap preflight caching at ~2h
     });
